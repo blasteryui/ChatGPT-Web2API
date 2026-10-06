@@ -24,6 +24,16 @@ from dataclasses import dataclass
 from .breakers import BreakerKind, BreakerRegistry
 from .diagnostics import diagnose
 from .lock_resolver import OwnedTabRequiredError
+from .provider_contract import (
+    EffectCertainty,
+    ModelSelectionError,
+    ProjectPlacementError,
+    ProviderOperationContext,
+    ProviderOperationReceipt,
+    ProviderOperationUncertainError,
+    hash_text,
+    summarize_turn_anchor,
+)
 
 try:
     import websockets
@@ -383,6 +393,7 @@ class CDPDriver:
         self._last_refresh_attempt_at: float = 0.0
         self._current_conv_id: str | None = None
         self._current_model: str | None = None
+        self._last_provider_receipt: ProviderOperationReceipt | None = None
         # CDP response routing (#7): id-keyed futures + background reader
         self._pending: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
@@ -1120,22 +1131,14 @@ class CDPDriver:
     # ── Model Selection ───────────────────────────────────────
 
     async def select_model(self, slug: str) -> bool:
-        """Select a model in the ChatGPT model picker.
+        """Best-effort legacy model selection.
 
-        Clicks the model picker button, waits for the dropdown,
-        finds the item matching *slug*, and clicks it.
-
-        Returns True if the model was selected, False if it failed
-        (e.g. model not found, picker not available).  Failures are
-        non-fatal — the request proceeds with whatever model is active.
+        This path preserves the historical permissive contract: failure returns
+        False and callers may continue with the active model.
         """
         if slug in ("auto", None, ""):
-            return True  # auto is the default, no action needed
+            return True
 
-        # Track the current model
-        self._current_model = slug
-
-        # Click the model picker button
         picker_clicked = await self._js(
             "(function() {"
             "  var btn = document.querySelector('#model-selector-btn') "
@@ -1149,23 +1152,19 @@ class CDPDriver:
         )
         if picker_clicked != "clicked":
             logger.warning(
-                "Model picker not found: %s — proceeding with active model", picker_clicked
+                "Model picker not found: %s - proceeding with active model", picker_clicked
             )
             return False
 
-        # Wait for dropdown to appear
         await asyncio.sleep(0.8)
-
-        # Find and click the target model item
-        # The dropdown renders model items as buttons or list items with the slug
         result = await self._js_with_data(
             "(function() {"
             "  var items = document.querySelectorAll("
-            '    \'button[data-testid*="model"], '
-            '    \'[class*="model-item"], '
-            '    \'[class*="modelOption"], '
-            '    \'li[class*="model"], '
-            "    'div[class*=\"model\"] button'"
+            "    'button[data-testid*=\"model\"], "
+            "    [class*=\"model-item\"], "
+            "    [class*=\"modelOption\"], "
+            "    li[class*=\"model\"], "
+            "    div[class*=\"model\"] button'"
             "  );"
             "  for (var i = 0; i < items.length; i++) {"
             "    var el = items[i];"
@@ -1176,7 +1175,6 @@ class CDPDriver:
             "      return 'selected';"
             "    }"
             "  }"
-            "  // Fallback: try broader search in the dropdown"
             "  var allBtns = document.querySelectorAll('button, [role=\"menuitem\"]');"
             "  for (var j = 0; j < allBtns.length; j++) {"
             "    var t = (allBtns[j].textContent || '').toLowerCase();"
@@ -1191,23 +1189,107 @@ class CDPDriver:
         )
 
         if result in ("selected", "selected-fallback"):
+            self._current_model = slug
             logger.info("Model selected: %s (%s)", slug, result)
-            await asyncio.sleep(0.5)  # Let UI settle
+            await asyncio.sleep(0.5)
             return True
 
-        # #8: Close the dropdown if model wasn't found, so it doesn't
-        # overlay the textarea and corrupt subsequent type/send operations.
         if result == "not-found":
             try:
-                await self._js_strict("document.body.click()")  # dismiss dropdown
+                await self._js_strict("document.body.click()")
             except Exception:
-                pass  # best-effort
+                pass
         logger.warning(
-            "Model '%s' not found in picker: %s — proceeding with active model", slug, result
+            "Model '%s' not found in picker: %s - proceeding with active model", slug, result
         )
         return False
 
-    # ── Navigation ────────────────────────────────────────────
+    @staticmethod
+    def _normalize_model_identity(value: str | None) -> str:
+        return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+    async def _read_active_model_identity(self) -> dict:
+        raw = await self._js_strict(
+            "(function(){"
+            " var b=document.querySelector('#model-selector-btn')"
+            " ||document.querySelector('button[aria-label*=\"Model\"]')"
+            " ||document.querySelector('[data-testid*=\"model\"]')"
+            " ||document.querySelector('button[class*=\"model\"]');"
+            " if(!b) return JSON.stringify({found:false});"
+            " return JSON.stringify({found:true,text:(b.innerText||b.textContent||'').trim(),"
+            " aria:b.getAttribute('aria-label')||'',slug:b.getAttribute('data-slug')||'',"
+            " model:b.getAttribute('data-model')||''});"
+            "})()"
+        )
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return {"found": False}
+        return data if isinstance(data, dict) else {"found": False}
+
+    async def select_model_verified(self, slug: str) -> str:
+        """Strict model selection for Vision/provider calls.
+
+        A click is not acceptance. The selected model must be independently
+        observed from the picker control before any Send is permitted.
+        """
+        if slug in ("auto", None, ""):
+            return "auto"
+        selected = await self.select_model(slug)
+        if not selected:
+            raise ModelSelectionError(slug, None)
+
+        requested = self._normalize_model_identity(slug)
+        observed_label = None
+        for _ in range(8):
+            data = await self._read_active_model_identity()
+            values = [
+                data.get("slug"),
+                data.get("model"),
+                data.get("text"),
+                data.get("aria"),
+            ]
+            for value in values:
+                normalized = self._normalize_model_identity(value)
+                if normalized and (
+                    normalized == requested
+                    or requested in normalized
+                    or normalized in requested
+                ):
+                    observed_label = value or slug
+                    self._current_model = slug
+                    return str(observed_label)
+            await asyncio.sleep(0.25)
+        raise ModelSelectionError(slug, observed_label)
+
+    async def observe_project_id(
+        self, requested_project_id: str | None = None
+    ) -> str | None:
+        """Read the live project ID, canonicalizing a slugged route against a request."""
+        try:
+            url = await self._js_strict("window.location.href")
+        except Exception:
+            return None
+        try:
+            parts = [p for p in urllib.parse.urlparse(url).path.split("/") if p]
+        except (TypeError, ValueError):
+            return None
+        for i, part in enumerate(parts[:-1]):
+            if part == "g" and parts[i + 1].startswith("g-p-"):
+                route_project_id = parts[i + 1]
+                if requested_project_id and (
+                    route_project_id == requested_project_id
+                    or route_project_id.startswith(f"{requested_project_id}-")
+                ):
+                    return requested_project_id
+                return route_project_id
+        return None
+
+    async def verify_project_placement(self, requested_project_id: str) -> str:
+        observed = await self.observe_project_id(requested_project_id)
+        if observed != requested_project_id:
+            raise ProjectPlacementError(requested_project_id, observed)
+        return observed
 
     async def navigate_new_chat(self, gizmo_id: str = None) -> None:
         """Navigate to a fresh chat. Optionally scope to a project gizmo."""
@@ -1278,7 +1360,9 @@ class CDPDriver:
         Delegated to ChatGPTDom (Phase 5 PR3 extraction)."""
         return await self._dom._wait_for_composer(timeout)
 
-    async def navigate_conversation(self, conversation_id: str) -> None:
+    async def navigate_conversation(
+        self, conversation_id: str, project_id: str | None = None
+    ) -> None:
         """Navigate to an existing conversation for multi-turn.
 
         Sets ``self._current_conv_id`` ONLY after the live tab is verified
@@ -1296,7 +1380,10 @@ class CDPDriver:
         fast-fails with ``nav_displaced`` if the URL moves away from the
         target mid-poll (detects SPA redirects / access-denied states).
         """
-        url = f"https://chatgpt.com/c/{conversation_id}"
+        if project_id:
+            url = f"https://chatgpt.com/g/{project_id}/c/{conversation_id}"
+        else:
+            url = f"https://chatgpt.com/c/{conversation_id}"
         logger.info("Navigate to conversation: %s", url)
         await self._cdp("Page.navigate", {"url": url})
         await asyncio.sleep(3)
@@ -1596,7 +1683,8 @@ class CDPDriver:
         Polls briefly (3s at 0.5s intervals). Never raises.
         """
         import time as _time
-        from .chatgpt_dom import COMPOSER_SELECTOR, COMPOSER_FALLBACK_SELECTOR
+
+        from .chatgpt_dom import COMPOSER_FALLBACK_SELECTOR, COMPOSER_SELECTOR
 
         pre_send_count = getattr(self, "_pre_send_user_count", None)
         if pre_send_count is None:
@@ -1724,40 +1812,43 @@ class CDPDriver:
         *,
         budgets=None,
         model: str | None = None,
+        operation_context: ProviderOperationContext | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Send a message and yield streaming response chunks.
 
-        A2 turn-correlation sequence (peer-reviewed, conv ``6a482cfd``):
-        1. Read assistant-count baseline (A1 fail-closed).
-        2. Health-check the identity listener; re-enable if stale.
-        3. Arm a per-send capture scope (IdentityListener).
-        4. Build a pre-send fallback anchor (existing/degraded/fresh — NO
-           captured UUID yet; the UUID only exists in the POST that
-           click_send generates).
-        5. type_message + click_send.
-        6. Wait for the IdentityListener to capture the UUID (short timeout).
-        7. Anchor = fallback.with_captured_id(uuid) if captured else fallback.
-        8. stream_until_complete(turn_anchor=anchor) + anchored reconciliation.
-        9. ALWAYS: scope.close() in finally (clears capture state on every
-           terminal path — success, timeout, exception, cancellation).
+        When operation_context is supplied, the send also maintains a durable
+        provider receipt. Any exception after click_send is surfaced as
+        ProviderOperationUncertainError with DELIVERY_UNCERTAIN evidence rather
+        than as a generic retryable send failure.
         """
         from .identity_listener import hash_sent_text
         from .turn_anchor import TurnReconciliationError
 
-        # PR4 belt-and-suspenders: refuse to mutate the DOM in parallel mode.
+        receipt = None
+        submission_possible = False
+        if operation_context is not None:
+            receipt = ProviderOperationReceipt(
+                operation_id=operation_context.operation_id,
+                conversation_id=self._current_conv_id,
+                target_id=self._target_id,
+                session_identity=self.instance_id,
+                requested_project_id=operation_context.requested_project_id,
+                observed_project_id=operation_context.observed_project_id,
+                requested_model=operation_context.requested_model,
+                observed_model=operation_context.observed_model,
+            )
+            self._last_provider_receipt = receipt
+
         self._assert_owned_tab_required()
-        # A1: count existing assistants BEFORE sending (fail-closed baseline).
         initial_count = await self._read_assistant_count_baseline()
 
-        # A2 Step 2: identity-listener health check.
         capture_scope = None
         if self._identity_listener is not None:
             await self._identity_listener.reenable_if_stale()
 
-        # A2 Step 3+4: arm capture scope + build fallback anchor.
-        # The fallback anchor captures pre-send state (backend node-ids/times
-        # or wall-clock) for dual-anchor correlation if UUID capture fails.
         fallback_anchor = await self._capture_pre_send_fallback_anchor(text)
+        if receipt is not None:
+            receipt.turn_anchor = summarize_turn_anchor(fallback_anchor)
         if self._identity_listener is not None and self._identity_listener.is_alive():
             capture_scope = self._identity_listener.arm_capture_scope(
                 expected_text_hash=hash_sent_text(text),
@@ -1766,35 +1857,24 @@ class CDPDriver:
             )
 
         try:
-            # Type and send.
             await self.type_message(text)
             await self.click_send()
+            submission_possible = True
+            if receipt is not None:
+                receipt.effect_certainty = EffectCertainty.DELIVERY_UNCERTAIN
+                receipt.response_status = "SEND_DISPATCHED"
 
-            # A2 Step 6: wait for the IdentityListener to capture the UUID.
             captured_uuid = None
             if capture_scope is not None:
                 captured_uuid = await self._identity_listener.wait_for_captured_uuid(timeout=5.0)
 
-            # P0 send acknowledgment (ChatGPT review, conv 6a52f0f3):
-            # click_send dispatches synthetic mouse events — that proves the
-            # JS ran, not that React accepted the submission. Under load, the
-            # click can fire without producing a user message. Before entering
-            # completion detection, verify at least one acknowledgment signal:
-            #   1. UUID was captured, OR
-            #   2. user-message count increased AND composer cleared
-            # If none → raise before entering completion detection (which would
-            # waste time polling for a response that will never come).
-            #
-            # Graceful: if the acknowledgment probe fails (JS error, mock
-            # environment, unusual DOM), DON'T block the send. The check is a
-            # safety net for the overloaded-page case, not a hard gate that
-            # could prevent sends in edge cases we haven't seen.
+            acknowledged = None
             if not captured_uuid:
                 try:
                     acknowledged = await self._verify_send_acknowledged()
-                    if acknowledged is False:  # explicitly False, not None
+                    if acknowledged is False:
                         raise SendReadinessError(
-                            "Send not acknowledged — click dispatched but no user "
+                            "Send not acknowledged - click dispatched but no user "
                             "message appeared (no UUID captured, user count unchanged, "
                             "composer not cleared). The page may be overloaded or the "
                             "send was rejected. Do NOT retry automatically."
@@ -1802,18 +1882,16 @@ class CDPDriver:
                 except SendReadinessError:
                     raise
                 except Exception as ack_err:
-                    # Probe failed (JS error, mock, unusual DOM). Don't block
-                    # the send — let completion detection proceed. Log so the
-                    # failure is traceable.
                     logger.debug("Send acknowledgment probe failed (non-blocking): %s", ack_err)
 
-            # A2 Step 7: build the final anchor (fallback + captured UUID).
             turn_anchor = fallback_anchor.with_captured_id(captured_uuid)
+            if receipt is not None:
+                receipt.turn_anchor = summarize_turn_anchor(turn_anchor)
+                receipt.captured_user_message_id = captured_uuid
+                if captured_uuid or acknowledged is True:
+                    receipt.effect_certainty = EffectCertainty.CONFIRMED_SUBMITTED
+                    receipt.response_status = "SUBMITTED"
 
-            # A2 Step 8: stream + completion with the anchored turn.
-            # P1: pass budgets + model for the model-aware two-state phase-2
-            # machine. When None (no config available), the detector uses the
-            # legacy single PHASE_STALL_SECONDS behavior.
             async for chunk in self._completion.stream_until_complete(
                 initial_count=initial_count,
                 timeout=timeout,
@@ -1823,7 +1901,6 @@ class CDPDriver:
             ):
                 yield chunk
 
-            # Wait for URL to become /c/{id}
             conv_id = ""
             for _ in range(30):
                 try:
@@ -1836,15 +1913,14 @@ class CDPDriver:
                     break
                 await asyncio.sleep(0.5)
 
+            final_text = self._completion.last_dom_text or ""
             if conv_id:
                 logger.info("Conversation: %s", conv_id)
                 self._current_conv_id = conv_id
+                if receipt is not None:
+                    receipt.conversation_id = conv_id
                 last_dom_text = self._completion.last_dom_text
                 had_non_text_content = self._completion.had_non_text_content
-                # A2: anchored final-text reconciliation. The selector resolves
-                # the terminal assistant text for THIS turn (by captured UUID
-                # or dual-anchor fallback); stale text from a prior turn is
-                # never accepted.
                 last_status = "not_ready"
                 last_diagnostic = {}
                 for _ in range(60):
@@ -1855,29 +1931,14 @@ class CDPDriver:
                         if len(result.text) > len(last_dom_text):
                             yield StreamChunk(delta=result.text[len(last_dom_text):])
                             last_dom_text = result.text
+                        final_text = result.text
                         break
                     if result.status == "non_text":
-                        # P2.5 RCA fix: non_text is NOT terminal here. The backend
-                        # propagates intermediary nodes (reasoning_recap, thoughts,
-                        # model_editable_context) BEFORE the final text node.
-                        # Treating non_text as terminal caused an intermittent
-                        # race: the reconciliation saw the intermediaries,
-                        # concluded "non-text", and yielded the placeholder even
-                        # though the text node would appear within seconds.
-                        # Now: keep polling (like not_ready) — the text node may
-                        # still be propagating. Only after the loop exhausts do we
-                        # yield the placeholder.
                         pass
                     if result.status in ("ambiguous", "degraded_not_fresh", "fetch_failed"):
-                        # Keep polling — these may resolve as the backend settles.
                         pass
-                    # not_ready → keep polling.
                     await asyncio.sleep(0.5)
                 else:
-                    # Loop exhausted without a text match.
-                    # If the last status was non_text (genuinely non-text
-                    # response after full polling), fall through to the
-                    # placeholder below. Otherwise raise a typed error.
                     if last_status != "non_text":
                         raise TurnReconciliationError(
                             conversation_id=conv_id,
@@ -1889,15 +1950,42 @@ class CDPDriver:
                                 "last_fetch_diagnostic": last_diagnostic,
                             },
                         )
-                # Non-text placeholder (unchanged from pre-A2).
                 if not last_dom_text and had_non_text_content:
                     placeholder = (
                         "[Non-text response generated (image/tool-use/etc.) — "
                         "use get_conversation to retrieve full content.]"
                     )
+                    final_text = placeholder
                     yield StreamChunk(delta=placeholder)
+
+            if receipt is not None:
+                receipt.conversation_id = receipt.conversation_id or self._current_conv_id
+                if not receipt.conversation_id:
+                    raise RuntimeError(
+                        "Strict provider send completed without a durable conversation ID; "
+                        "reconcile the operation before any retry."
+                    )
+                receipt.response_sha256 = hash_text(final_text) if final_text else None
+                receipt.response_status = "COMPLETE"
+                receipt.effect_certainty = EffectCertainty.CONFIRMED_COMPLETE
+                self._last_provider_receipt = receipt
+        except ProviderOperationUncertainError:
+            raise
+        except Exception as exc:
+            if receipt is not None and submission_possible:
+                if not receipt.conversation_id:
+                    try:
+                        receipt.conversation_id = await self._get_live_conversation_id_best_effort()
+                    except Exception:
+                        pass
+                receipt.effect_certainty = EffectCertainty.DELIVERY_UNCERTAIN
+                receipt.response_status = "DELIVERY_UNCERTAIN"
+                receipt.error_type = type(exc).__name__
+                receipt.error_message = str(exc)[:500]
+                self._last_provider_receipt = receipt
+                raise ProviderOperationUncertainError(receipt, exc) from exc
+            raise
         finally:
-            # A2 Step 9: ALWAYS clear the capture scope (failure-mode E).
             if capture_scope is not None:
                 capture_scope.close()
 
@@ -1992,6 +2080,20 @@ class CDPDriver:
         Delegated to BackendClient (Phase 5 PR1 extraction)."""
         return await self._backend_client.get_conversation(conversation_id)
 
+    async def search_conversations(self, query: str, cursor: str | None = None) -> dict:
+        """Search conversations for reconciliation by nonce/turn marker."""
+        return await self._backend_client.search_conversations(query, cursor)
+
+    async def reconcile_conversation_turn(
+        self,
+        query: str,
+        *,
+        exact_user_text: str | None = None,
+    ) -> dict:
+        return await self._backend_client.reconcile_conversation_turn(
+            query, exact_user_text=exact_user_text
+        )
+
     @diagnose("delete_conversation")
     async def delete_conversation(self, conversation_id: str) -> bool:
         """Delete a conversation. Delegated to BackendClient (Phase 5 PR1)."""
@@ -2000,6 +2102,14 @@ class CDPDriver:
     async def rename_conversation(self, conversation_id: str, title: str) -> bool:
         """Rename a conversation. Delegated to BackendClient (Phase 5 PR1)."""
         return await self._backend_client.rename_conversation(conversation_id, title)
+
+    async def rename_conversation_verified(
+        self, conversation_id: str, title: str
+    ) -> dict:
+        """Rename and verify via independent backend readback."""
+        return await self._backend_client.rename_conversation_verified(
+            conversation_id, title
+        )
 
     # ── Project Management ────────────────────────────────────
 

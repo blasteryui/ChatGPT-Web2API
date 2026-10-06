@@ -40,6 +40,7 @@ import logging
 import time
 
 from .breakers import BreakerKind
+from .provider_contract import BackendHTTPError, RenameVerificationError
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,48 @@ class BackendClient:
 
     def __init__(self, driver) -> None:
         self._driver = driver
+
+    def _decode_backend_json_response(self, raw: str, endpoint: str):
+        """Decode a status-preserving backend fetch envelope.
+
+        New provider reads carry status, body, and retry metadata so a 429 or
+        other non-2xx response cannot be mistaken for an empty successful read.
+        Legacy raw JSON is still accepted for mocked/back-compatible seams.
+        """
+        from .cdp_driver import AuthExpiredError, CDPJSError
+
+        if not raw:
+            raise CDPJSError(f"empty backend response for {endpoint}")
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, TypeError) as e:
+            self._check_auth_in_raw(raw)
+            raise CDPJSError(f"unparseable backend response for {endpoint}: {e}") from e
+
+        if isinstance(payload, dict) and payload.get("__backend_http") is True:
+            status = int(payload.get("status") or 0)
+            body = payload.get("body") or ""
+            if status == 401:
+                if self._driver._breakers:
+                    self._driver._breakers.trip(
+                        BreakerKind.AUTH_EXPIRED, f"HTTP 401 from {endpoint}"
+                    )
+                raise AuthExpiredError()
+            if status < 200 or status >= 300:
+                raise BackendHTTPError(
+                    endpoint,
+                    status,
+                    body,
+                    retry_after=payload.get("retry_after"),
+                )
+            self._check_auth_in_raw(body)
+            try:
+                return json.loads(body)
+            except (json.JSONDecodeError, TypeError) as e:
+                raise CDPJSError(f"unparseable JSON body from {endpoint}: {e}") from e
+
+        self._check_auth_in_raw(raw)
+        return payload
 
     # ── Token Management ──────────────────────────────────────
 
@@ -449,23 +492,19 @@ class BackendClient:
         limit: int = 28,
         order: str = "updated",
     ) -> list[dict]:
-        """List recent conversations."""
+        """List recent conversations without collapsing backend HTTP errors."""
         from .cdp_driver import CDPJSError
 
         d = self._driver
+        endpoint = "/backend-api/conversations"
         await self._driver.ensure_token()
         try:
             raw = await d._js_with_data_strict(
                 "(async () => {"
-                "  var r = await fetch('/backend-api/conversations?offset=' + __D.offset + '&limit=' + __D.limit + '&order=' + __D.order, {"
-                "    headers: {'Authorization': 'Bearer ' + __D.token}"
-                "  });"
-                "  var data = await r.json();"
-                "  return JSON.stringify((data.items || []).map(function(c) {"
-                "    return {id: c.id, title: c.title || 'Untitled', "
-                "      update_time: c.update_time, create_time: c.create_time,"
-                "      is_archived: !!c.is_archived, gizmo_id: c.gizmo_id || null};"
-                "  }));"
+                "  var url = '/backend-api/conversations?offset=' + __D.offset + '&limit=' + __D.limit + '&order=' + __D.order;"
+                "  var r = await fetch(url, {headers: {'Authorization': 'Bearer ' + __D.token}});"
+                "  return JSON.stringify({__backend_http:true,status:r.status,"
+                "    retry_after:r.headers.get('retry-after'),body:await r.text()});"
                 "})()",
                 {
                     "token": d._access_token,
@@ -474,17 +513,120 @@ class BackendClient:
                     "order": order,
                 },
             )
-            self._check_auth_in_raw(raw)
-            return json.loads(raw)
-        except (CDPJSError, json.JSONDecodeError) as e:
-            logger.warning("get_conversations failed: %s", e)
+            data = self._decode_backend_json_response(raw, endpoint)
+            items = data.get("items", []) if isinstance(data, dict) else data
+            return [
+                {
+                    "id": c.get("id") or c.get("conversation_id"),
+                    "title": c.get("title") or "Untitled",
+                    "update_time": c.get("update_time"),
+                    "create_time": c.get("create_time"),
+                    "is_archived": bool(c.get("is_archived")),
+                    "gizmo_id": c.get("gizmo_id"),
+                }
+                for c in (items or [])
+                if isinstance(c, dict)
+            ]
+        except BackendHTTPError:
+            raise
+        except CDPJSError as e:
+            logger.warning("get_conversations transport failed: %s", e)
             return []
 
-    async def get_conversation(self, conversation_id: str) -> dict:
-        """Get full conversation detail with message mapping."""
+    async def search_conversations(
+        self,
+        query: str,
+        cursor: str | None = None,
+    ) -> dict:
+        """Search conversations for a nonce or turn marker."""
         from .cdp_driver import CDPJSError
 
         d = self._driver
+        endpoint = "/backend-api/conversations/search"
+        await self._driver.ensure_token()
+        raw = await d._js_with_data_strict(
+            "(async () => {"
+            "  var qs = new URLSearchParams({query: __D.query});"
+            "  if (__D.cursor) qs.set('cursor', __D.cursor);"
+            "  var r = await fetch('/backend-api/conversations/search?' + qs.toString(), {"
+            "    headers: {'Authorization': 'Bearer ' + __D.token}"
+            "  });"
+            "  return JSON.stringify({__backend_http:true,status:r.status,"
+            "    retry_after:r.headers.get('retry-after'),body:await r.text()});"
+            "})()",
+            {"token": d._access_token, "query": query, "cursor": cursor or ""},
+            timeout=30,
+        )
+        data = self._decode_backend_json_response(raw, endpoint)
+        if not isinstance(data, dict):
+            raise CDPJSError("conversation search returned non-object JSON")
+        items = []
+        for item in data.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            row = dict(item)
+            row.setdefault("id", row.get("conversation_id"))
+            items.append(row)
+        return {"items": items, "cursor": data.get("cursor")}
+
+    async def reconcile_conversation_turn(
+        self,
+        query: str,
+        *,
+        exact_user_text: str | None = None,
+    ) -> dict:
+        """Search by query and confirm matching user turns in exact histories."""
+        from .turn_anchor import normalize_text
+
+        result = await self.search_conversations(query)
+        expected = normalize_text(exact_user_text) if exact_user_text is not None else None
+        query_normalized = normalize_text(query)
+        matches = []
+        for item in result.get("items", []):
+            conversation_id = item.get("conversation_id") or item.get("id")
+            if not conversation_id:
+                continue
+            history = await self._driver.get_conversation(conversation_id)
+            mapping = history.get("mapping") if isinstance(history, dict) else None
+            if not isinstance(mapping, dict):
+                continue
+            turn_matches = []
+            for node_id, node in mapping.items():
+                if not isinstance(node, dict):
+                    continue
+                message = node.get("message") or {}
+                role = ((message.get("author") or {}).get("role") or "")
+                if role != "user":
+                    continue
+                parts = ((message.get("content") or {}).get("parts") or [])
+                body_text = "\n".join(part for part in parts if isinstance(part, str))
+                normalized = normalize_text(body_text)
+                hit = normalized == expected if expected is not None else query_normalized in normalized
+                if hit:
+                    turn_matches.append(
+                        {
+                            "node_id": node_id,
+                            "message_id": message.get("id"),
+                            "text": body_text,
+                        }
+                    )
+            if turn_matches:
+                matches.append(
+                    {
+                        "conversation_id": conversation_id,
+                        "title": item.get("title"),
+                        "gizmo_id": item.get("gizmo_id"),
+                        "turns": turn_matches,
+                    }
+                )
+        return {"query": query, "matches": matches, "cursor": result.get("cursor")}
+
+    async def get_conversation(self, conversation_id: str) -> dict:
+        """Get full conversation detail with typed backend HTTP failures."""
+        from .cdp_driver import CDPJSError
+
+        d = self._driver
+        endpoint = f"/backend-api/conversation/{conversation_id}"
         await self._driver.ensure_token()
         try:
             raw = await d._js_with_data_strict(
@@ -492,15 +634,18 @@ class BackendClient:
                 "  var r = await fetch('/backend-api/conversation/' + __D.conv_id, {"
                 "    headers: {'Authorization': 'Bearer ' + __D.token}"
                 "  });"
-                "  return await r.text();"
+                "  return JSON.stringify({__backend_http:true,status:r.status,"
+                "    retry_after:r.headers.get('retry-after'),body:await r.text()});"
                 "})()",
                 {"conv_id": conversation_id, "token": d._access_token},
                 timeout=30,
             )
-            self._check_auth_in_raw(raw)
-            return json.loads(raw)
-        except (CDPJSError, json.JSONDecodeError) as e:
-            logger.warning("get_conversation failed: %s", e)
+            data = self._decode_backend_json_response(raw, endpoint)
+            return data if isinstance(data, dict) else {}
+        except BackendHTTPError:
+            raise
+        except CDPJSError as e:
+            logger.warning("get_conversation transport failed: %s", e)
             return {}
 
     async def delete_conversation(self, conversation_id: str) -> bool:
@@ -535,33 +680,72 @@ class BackendClient:
         return False
 
     async def rename_conversation(self, conversation_id: str, title: str) -> bool:
-        """Rename a conversation. Returns True on success."""
-        from .cdp_driver import CDPJSError
+        """Rename a conversation while preserving non-2xx backend status."""
+        from .cdp_driver import AuthExpiredError, CDPJSError
 
         d = self._driver
+        endpoint = f"/backend-api/conversation/{conversation_id}"
         await self._driver.ensure_token()
         try:
-            result = await d._js_with_data_strict(
+            raw = await d._js_with_data_strict(
                 "(async () => {"
-                "  try {"
-                "    var r = await fetch('/backend-api/conversation/' + __D.conv_id, {"
-                "      method: 'PATCH',"
-                "      headers: {'Authorization': 'Bearer ' + __D.token, 'Content-Type': 'application/json'},"
-                "      body: JSON.stringify({title: __D.title})"
-                "    });"
-                "    return r.ok ? 'true' : 'false';"
-                "  } catch(e) { return 'error:' + e.message; }"
+                "  var r = await fetch('/backend-api/conversation/' + __D.conv_id, {"
+                "    method: 'PATCH',"
+                "    headers: {'Authorization': 'Bearer ' + __D.token, 'Content-Type': 'application/json'},"
+                "    body: JSON.stringify({title: __D.title})"
+                "  });"
+                "  return JSON.stringify({__backend_http:true,status:r.status,"
+                "    retry_after:r.headers.get('retry-after'),body:await r.text()});"
                 "})()",
                 {"conv_id": conversation_id, "token": d._access_token, "title": title},
             )
+            envelope = json.loads(raw)
+            if not isinstance(envelope, dict) or envelope.get("__backend_http") is not True:
+                if raw == "true":
+                    return True
+                if raw == "false":
+                    return False
+                raise CDPJSError("rename returned invalid response envelope")
+            status = int(envelope.get("status") or 0)
+            body = envelope.get("body") or ""
+            if status == 401:
+                if d._breakers:
+                    d._breakers.trip(BreakerKind.AUTH_EXPIRED, f"HTTP 401 from {endpoint}")
+                raise AuthExpiredError()
+            if status < 200 or status >= 300:
+                raise BackendHTTPError(
+                    endpoint,
+                    status,
+                    body,
+                    retry_after=envelope.get("retry_after"),
+                )
+        except BackendHTTPError:
+            raise
         except CDPJSError as e:
             logger.warning("rename_conversation JS failed: %s", e)
-            result = "false"
-        if result == "true":
-            logger.info("Renamed conversation %s to: %s", conversation_id, title)
-            return True
-        logger.warning("Failed to rename conversation: %s", result)
-        return False
+            return False
+        logger.info("Renamed conversation %s to: %s", conversation_id, title)
+        return True
+
+    async def rename_conversation_verified(
+        self,
+        conversation_id: str,
+        title: str,
+    ) -> dict:
+        """Rename then independently re-read the exact persisted title."""
+        ok = await self._driver.rename_conversation(conversation_id, title)
+        if not ok:
+            raise RenameVerificationError(conversation_id, title, None)
+        history = await self._driver.get_conversation(conversation_id)
+        observed = history.get("title") if isinstance(history, dict) else None
+        if observed != title:
+            raise RenameVerificationError(conversation_id, title, observed)
+        return {
+            "success": True,
+            "conversation_id": conversation_id,
+            "requested_title": title,
+            "observed_title": observed,
+        }
 
     # ── Project Management ────────────────────────────────────
 
