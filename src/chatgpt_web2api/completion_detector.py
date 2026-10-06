@@ -355,6 +355,9 @@ class CompletionDetector:
         deadline = time.monotonic() + timeout
         last_node_count = initial_count
         last_progress = time.monotonic()
+        phase1_conv_id = ""
+        last_conv_id_probe = 0.0
+        last_backend_probe = 0.0
         while time.monotonic() < deadline:
             # First check for ChatGPT's rate-limit pop-up — if present, fail
             # fast with a clear error instead of waiting out the whole timeout.
@@ -389,6 +392,37 @@ class CompletionDetector:
                 last_progress = time.monotonic()
             if current_count > initial_count:
                 break
+
+            # The rendered assistant node is a UI detail, not proof that the
+            # submitted turn failed. Some ChatGPT layouts delay or omit that
+            # node while the authenticated conversation mapping already has
+            # the terminal, turn-anchored assistant answer. Probe only after a
+            # conversation id is available and at the same bounded cadence as
+            # Phase 2; a matched terminal backend answer is authoritative.
+            now = time.monotonic()
+            if not phase1_conv_id and now - last_conv_id_probe >= 1.0:
+                last_conv_id_probe = now
+                try:
+                    phase1_conv_id = await d._get_live_conversation_id_best_effort()
+                except Exception as e:
+                    logger.debug("Phase-1 conversation-id probe failed: %s", e)
+            if phase1_conv_id and now - last_backend_probe >= 3.0:
+                last_backend_probe = now
+                try:
+                    backend_text = await d._fetch_text_for_turn(phase1_conv_id, turn_anchor)
+                    if backend_text.status == "matched" and backend_text.text:
+                        self.last_dom_text = backend_text.text
+                        logger.info(
+                            "Phase-1 appearance bypassed by turn-anchored backend completion for %s",
+                            phase1_conv_id,
+                        )
+                        yield StreamChunk(delta=backend_text.text)
+                        return
+                except AuthExpiredError:
+                    raise
+                except Exception as e:
+                    logger.debug("Phase-1 backend completion probe failed: %s", e)
+
             if time.monotonic() - last_progress > PHASE_STALL_SECONDS:
                 raise GenerationStuckError("phase_1_appear", time.monotonic() - last_progress)
             await asyncio.sleep(0.5)
