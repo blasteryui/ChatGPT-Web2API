@@ -1360,6 +1360,26 @@ class CDPDriver:
         Delegated to ChatGPTDom (Phase 5 PR3 extraction)."""
         return await self._dom._wait_for_composer(timeout)
 
+    async def _resolve_project_route_segment(self, project_id: str) -> str:
+        """Return the canonical ChatGPT project path segment when available.
+
+        ChatGPT project URLs use a slugged short_url. The backend identity remains
+        the bare project ID. Prefer the canonical path segment because the bare
+        route is not guaranteed to redirect to a ready composer.
+        """
+        try:
+            projects = await self.get_projects()
+            for project in projects:
+                if str(project.get("id") or "") != project_id:
+                    continue
+                short_url = str(project.get("short_url") or "").strip()
+                if short_url:
+                    return short_url
+                break
+        except Exception as exc:
+            logger.debug("Project short_url lookup failed; using bare project id: %s", exc)
+        return project_id
+
     async def navigate_conversation(
         self, conversation_id: str, project_id: str | None = None
     ) -> None:
@@ -1381,7 +1401,8 @@ class CDPDriver:
         target mid-poll (detects SPA redirects / access-denied states).
         """
         if project_id:
-            url = f"https://chatgpt.com/g/{project_id}/c/{conversation_id}"
+            project_route = await self._resolve_project_route_segment(project_id)
+            url = f"https://chatgpt.com/g/{project_route}/c/{conversation_id}"
         else:
             url = f"https://chatgpt.com/c/{conversation_id}"
         logger.info("Navigate to conversation: %s", url)

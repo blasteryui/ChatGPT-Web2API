@@ -248,6 +248,8 @@ async def test_navigate_conversation_uses_project_route_only_when_requested(
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", _no_sleep)
     driver = CDPDriver(cdp_port=9222)
     driver._cdp = AsyncMock()
+    if project_id:
+        driver.get_projects = AsyncMock(return_value=[])
     driver._js_strict = AsyncMock(
         return_value=json.dumps(
             {
@@ -387,3 +389,39 @@ async def test_rest_wrong_project_precondition_never_reaches_send(monkeypatch):
     assert payload["error"]["code"] == "project_verification_failed"
     server._full_response.assert_not_awaited()
     driver.send_and_stream.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_navigate_conversation_prefers_canonical_project_short_url(monkeypatch):
+    async def _no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", _no_sleep)
+    driver = CDPDriver(cdp_port=9222)
+    driver._cdp = AsyncMock()
+    driver.get_projects = AsyncMock(
+        return_value=[
+            {
+                "id": "g-p-XYZ",
+                "name": "Vision",
+                "short_url": "g-p-XYZ-vision",
+            }
+        ]
+    )
+    driver._js_strict = AsyncMock(
+        return_value=json.dumps(
+            {
+                "url": "https://chatgpt.com/g/g-p-XYZ-vision/c/conv-1",
+                "ready_state": "complete",
+                "app_shell": True,
+                "composer": True,
+            }
+        )
+    )
+
+    await driver.navigate_conversation("conv-1", project_id="g-p-XYZ")
+
+    driver._cdp.assert_awaited_once_with(
+        "Page.navigate",
+        {"url": "https://chatgpt.com/g/g-p-XYZ-vision/c/conv-1"},
+    )
+    assert driver._current_conv_id == "conv-1"
