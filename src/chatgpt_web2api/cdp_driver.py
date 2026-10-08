@@ -1227,6 +1227,93 @@ class CDPDriver:
             return {"found": False}
         return data if isinstance(data, dict) else {"found": False}
 
+    async def _verify_model_via_radio_menu(self, slug: str) -> str | None:
+        """Use the current ChatGPT Radix model menu as positive model evidence.
+
+        The toolbar shows thinking effort (e.g. Medium), not model identity.
+        Never infer model identity from the effort label. This pathway changes
+        only the model radio selection, and verifies aria-checked after change.
+        """
+        open_menu = (
+            "(function(){"
+            "var b=document.querySelector('button[aria-label=\"Select ChatGPT model\"]');"
+            "if(!b) return 'no-picker';"
+            "if(b.getAttribute('data-state')!=='open') b.click();"
+            "return 'opened';"
+            "})()"
+        )
+        if await self._js(open_menu) != "opened":
+            return None
+        await asyncio.sleep(0.2)
+
+        read_menu = (
+            "(function(){"
+            "var m=document.querySelector('[role=\"menu\"][data-state=\"open\"]');"
+            "if(!m) return JSON.stringify({visible:false});"
+            "var radios=Array.from(m.querySelectorAll('[role=\"menuitemradio\"]')).map(function(e){"
+            "var label=(e.innerText||e.textContent||'').trim().split('\\n')[0].trim();"
+            "return {label:label,checked:e.getAttribute('aria-checked')==='true'};"
+            "});"
+            "return JSON.stringify({visible:true,radios:radios});"
+            "})()"
+        )
+        close_menu = (
+            "(function(){"
+            "var b=document.querySelector('button[aria-label=\"Select ChatGPT model\"]');"
+            "if(b&&b.getAttribute('data-state')==='open') b.click();"
+            "return 'closed';"
+            "})()"
+        )
+
+        def target_radio(state: dict) -> dict | None:
+            radios = state.get("radios") or []
+            requested = self._normalize_model_identity(slug)
+            return next(
+                (r for r in radios if isinstance(r, dict)
+                 and self._normalize_model_identity(r.get("label")) == requested),
+                None,
+            )
+
+        state = json.loads(await self._js_strict(read_menu))
+        if not state.get("visible"):
+            return None
+        found = target_radio(state)
+        if not found:
+            await self._js(close_menu)
+            return None
+        if not found.get("checked"):
+            clicked = await self._js_with_data_strict(
+                "(function(){"
+                "var m=document.querySelector('[role=\"menu\"][data-state=\"open\"]');"
+                "if(!m) return 'no-menu';"
+                "var radios=m.querySelectorAll('[role=\"menuitemradio\"]');"
+                "for(var i=0;i<radios.length;i++){"
+                "var t=(radios[i].innerText||radios[i].textContent||'').trim().split('\\n')[0]"
+                ".toLowerCase().replace(/[^a-z0-9]+/g,'');"
+                "if(t===__D.slug){radios[i].click();return 'clicked';}"
+                "}"
+                "return 'not-found';"
+                "})()",
+                {"slug": self._normalize_model_identity(slug)},
+            )
+            if clicked != "clicked":
+                raise ModelSelectionError(slug, None)
+            await asyncio.sleep(0.35)
+            if await self._js(open_menu) != "opened":
+                raise ModelSelectionError(slug, None)
+            await asyncio.sleep(0.2)
+            state = json.loads(await self._js_strict(read_menu))
+            found = target_radio(state)
+
+        await self._js(close_menu)
+        if found and found.get("checked"):
+            self._current_model = slug
+            return str(found["label"])
+        observed = next(
+            (r.get("label") for r in state.get("radios", []) if r.get("checked")),
+            None,
+        )
+        raise ModelSelectionError(slug, observed)
     async def select_model_verified(self, slug: str) -> str:
         """Strict model selection for Vision/provider calls.
 
@@ -1235,6 +1322,9 @@ class CDPDriver:
         """
         if slug in ("auto", None, ""):
             return "auto"
+        observed_radio = await self._verify_model_via_radio_menu(slug)
+        if observed_radio is not None:
+            return observed_radio
         selected = await self.select_model(slug)
         if not selected:
             raise ModelSelectionError(slug, None)

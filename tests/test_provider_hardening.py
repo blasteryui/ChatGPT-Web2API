@@ -215,6 +215,7 @@ async def test_uncertain_receipt_retains_turn_anchor_and_never_replays():
 async def test_verified_model_failure_raises_before_any_send_primitive():
     driver = CDPDriver(cdp_port=9222)
     driver.select_model = AsyncMock(return_value=False)
+    driver._verify_model_via_radio_menu = AsyncMock(return_value=None)
     driver.click_send = AsyncMock()
 
     with pytest.raises(ModelSelectionError):
@@ -425,3 +426,58 @@ async def test_navigate_conversation_prefers_canonical_project_short_url(monkeyp
         {"url": "https://chatgpt.com/g/g-p-XYZ-vision/c/conv-1"},
     )
     assert driver._current_conv_id == "conv-1"
+
+
+@pytest.mark.asyncio
+async def test_model_radio_checked_gpt6_is_verified():
+    driver = CDPDriver(cdp_port=9222)
+    driver._js = AsyncMock(side_effect=["opened", "closed"])
+    driver._js_strict = AsyncMock(return_value=json.dumps({
+        "visible": True,
+        "radios": [
+            {"label": "GPT-6", "checked": True},
+            {"label": "GPT-5.6 Sol", "checked": False}
+        ],
+    }))
+    driver.select_model = AsyncMock(return_value=False)
+    result = await driver.select_model_verified("gpt-6")
+    assert result == "GPT-6"
+    assert driver._current_model == "gpt-6"
+    driver.select_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_model_radio_switch_requires_positive_checked_evidence():
+    driver = CDPDriver(cdp_port=9222)
+    driver._js = AsyncMock(side_effect=["opened", "opened", "closed"])
+    before = json.dumps({"visible": True, "radios": [
+        {"label": "GPT-6", "checked": False},
+        {"label": "GPT-5.6 Sol", "checked": True},
+    ]})
+    after = json.dumps({"visible": True, "radios": [
+        {"label": "GPT-6", "checked": True},
+        {"label": "GPT-5.6 Sol", "checked": False},
+    ]})
+    driver._js_strict = AsyncMock(side_effect=[before, after])
+    driver._js_with_data_strict = AsyncMock(return_value="clicked")
+    driver.select_model = AsyncMock(return_value=False)
+    result = await driver.select_model_verified("gpt-6")
+    assert result == "GPT-6"
+    driver._js_with_data_strict.assert_awaited_once()
+    driver.select_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_model_radio_fails_closed_after_unconfirmed_switch():
+    driver = CDPDriver(cdp_port=9222)
+    driver._js = AsyncMock(side_effect=["opened", "opened", "closed"])
+    stale = json.dumps({"visible": True, "radios": [
+        {"label": "GPT-6", "checked": False},
+        {"label": "GPT-5.6 Sol", "checked": True},
+    ]})
+    driver._js_strict = AsyncMock(side_effect=[stale, stale])
+    driver._js_with_data_strict = AsyncMock(return_value="clicked")
+    driver.click_send = AsyncMock()
+    with pytest.raises(ModelSelectionError):
+        await driver.select_model_verified("gpt-6")
+    driver.click_send.assert_not_awaited()
