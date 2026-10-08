@@ -56,6 +56,7 @@ class ChromeConfig:
     headless: bool = False
     extra_args: list[str] = field(default_factory=list)
     restart_on_crash: bool = True
+    attach_only: bool = False
 
 
 @dataclass
@@ -229,6 +230,9 @@ class Config:
         c = data.get("cdp_port")
         if c is not None:
             self.chrome.cdp_port = int(c)
+        c = data.get("attach_only")
+        if c is not None:
+            self.chrome.attach_only = _as_bool(c)
         c = data.get("headless")
         if c is not None:
             self.chrome.headless = _as_bool(c)
@@ -315,6 +319,8 @@ class Config:
             self.chrome.chrome_path = v
         if v := _env("W2A_USER_DATA_DIR"):
             self.chrome.user_data_dir = v
+        if v := _env("W2A_ATTACH_ONLY"):
+            self.chrome.attach_only = _as_bool(v)
         if v := _env("W2A_CDP_PORT"):
             self.chrome.cdp_port = int(v)
         if v := _env("W2A_PORT"):

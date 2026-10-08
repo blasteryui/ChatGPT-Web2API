@@ -471,3 +471,50 @@ async def test_stop_owner_kills_attacher_does_not():
     await owner.stop()
     assert owner_kill["n"] == 1, "owner must kill"
     assert owner._owns_chrome is False, "owner relinquishes on stop"
+
+
+@pytest.mark.asyncio
+async def test_attach_only_refuses_to_start_another_browser(monkeypatch):
+    """Externally-owned CDP unavailable: fail without election or Chrome launch."""
+    chrome = _make_chrome()
+    chrome._cfg.attach_only = True
+    launched = []
+
+    async def down():
+        return False
+
+    async def forbidden_launch():
+        launched.append(True)
+
+    chrome._cdp_alive = down
+    chrome._launch = forbidden_launch
+    monkeypatch.setattr(chrome_mod, "CrossProcessLock", _NullLock)
+
+    with pytest.raises(RuntimeError, match="Attach-only mode"):
+        await chrome.ensure_running()
+
+    assert launched == []
+    assert chrome._process is None
+    assert chrome._owns_chrome is False
+    assert chrome._healthy is False
+
+
+@pytest.mark.asyncio
+async def test_attach_only_uses_the_existing_browser_without_claiming_it(monkeypatch):
+    """An existing CDP is attached without becoming the Chrome lifecycle owner."""
+    chrome = _make_chrome()
+    chrome._cfg.attach_only = True
+
+    async def up():
+        return True
+
+    async def forbidden_launch():
+        raise AssertionError("attacher must not launch Chrome")
+
+    chrome._cdp_alive = up
+    chrome._launch = forbidden_launch
+    monkeypatch.setattr(chrome_mod, "CrossProcessLock", _NullLock)
+    await chrome.ensure_running()
+
+    assert chrome._owns_chrome is False
+    assert chrome._healthy is True

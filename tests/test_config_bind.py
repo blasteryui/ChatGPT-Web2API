@@ -167,3 +167,16 @@ def test_ensure_config_to_dict_roundtrip():
     assert d["ensure_degraded_poll_budget_s"] == 11.0
     assert d["ensure_breaker_cooldown_grace_s"] == 5.0
 
+
+
+def test_linux_attach_only_config(tmp_path, monkeypatch):
+    """Opt-in attach-only mode is config- and environment-driven, default off."""
+    monkeypatch.delenv("W2A_ATTACH_ONLY", raising=False)
+    assert Config().chrome.attach_only is False
+    path = tmp_path / "linux-web2api.json"
+    path.write_text(json.dumps({"attach_only": True, "cdp_port": 19292}))
+    cfg = Config.load(str(path))
+    assert cfg.chrome.attach_only is True
+    assert cfg.chrome.cdp_port == 19292
+    monkeypatch.setenv("W2A_ATTACH_ONLY", "false")
+    assert Config.load(str(path)).chrome.attach_only is False
