@@ -380,7 +380,7 @@ class CompletionDetector:
 
             try:
                 raw = await d._js_strict(
-                    "document.querySelectorAll('[data-message-author-role=\"assistant\"]').length"
+                    "document.querySelectorAll('[data-message-author-role=\"assistant\"], [data-chatgpt-selection-message-id]').length"
                 )
                 current_count = int(raw or 0)
             except CDPJSError:
@@ -508,7 +508,7 @@ class CompletionDetector:
             try:
                 result = await d._js_strict(
                     "(function() {"
-                    "  var msgs = document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
+                    "  var msgs = document.querySelectorAll('[data-message-author-role=\"assistant\"], [data-chatgpt-selection-message-id]');"
                     "  if (!msgs.length) return JSON.stringify({text:'', md_text:'', html_len:0, child_count:0, has_action:false, is_thinking:false});"
                     "  var last = msgs[msgs.length - 1];"
                     # Text: the clean answer lives in ``.markdown`` textContent.
@@ -554,6 +554,7 @@ class CompletionDetector:
                     '            [data-testid*="copy"],'
                     '            [data-testid*="response-turn"]\';'
                     "  var has_action = (function() {"
+                    "    if(last.closest('[data-talvt-turn-state=complete]')) return true;"
                     "    var lastRect = last.getBoundingClientRect();"
                     "    var scope = last;"
                     "    for (var d = 0; scope && d <= 8; d++, scope = scope.parentElement) {"
