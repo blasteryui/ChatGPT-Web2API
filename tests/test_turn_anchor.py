@@ -386,3 +386,42 @@ class TestNormalize:
 
     def test_crlf_to_lf(self):
         assert normalize_text("a\r\nb\rc") == "a\nb\nc"
+
+
+def test_fresh_chat_client_uuid_drift_recovers_unique_terminal_answer():
+    user = _user_node("bbb-real-user", "[User]\nVISION_LINUX_WEB2API_GPT6_CANARY", 100.5, children=["bbb-answer"])
+    assistant = _assistant_node("bbb-answer", "VISION_LINUX_WEB2API_GPT6_OK", 101.5, end_turn=True, parent="bbb-real-user")
+    mapping = _mapping(("bbb-real-user", user), ("bbb-answer", assistant))
+    anchor = TurnAnchor(
+        sent_text="[User]\nVISION_LINUX_WEB2API_GPT6_CANARY",
+        mode="fresh_chat",
+        captured_user_message_id="client-generated-uuid",
+        pre_send_wall_time=100.0,
+    )
+    result = select_text_for_turn(mapping, anchor)
+    assert result.status == "matched"
+    assert result.text == "VISION_LINUX_WEB2API_GPT6_OK"
+
+
+def test_fresh_chat_client_uuid_drift_does_not_accept_old_exact_text():
+    user = _user_node("bbb-old-user", "[User]\nVISION_LINUX_WEB2API_GPT6_CANARY", 80.0, children=["bbb-old-answer"])
+    assistant = _assistant_node("bbb-old-answer", "stale", 81.0, end_turn=True, parent="bbb-old-user")
+    mapping = _mapping(("bbb-old-user", user), ("bbb-old-answer", assistant))
+    anchor = TurnAnchor(
+        sent_text="[User]\nVISION_LINUX_WEB2API_GPT6_CANARY",
+        mode="fresh_chat",
+        captured_user_message_id="client-generated-uuid",
+        pre_send_wall_time=100.0,
+    )
+    assert select_text_for_turn(mapping, anchor).status == "not_ready"
+
+
+def test_fresh_chat_client_uuid_drift_rejects_multiple_matching_users():
+    one = _user_node("bbb-first", "same text", 101.0, children=["aaa"])
+    two = _user_node("bbb-second", "same text", 102.0, children=["bbb"])
+    mapping = _mapping(("bbb-first", one), ("bbb-second", two))
+    anchor = TurnAnchor(
+        sent_text="same text", mode="fresh_chat",
+        captured_user_message_id="client-generated-uuid", pre_send_wall_time=100.0,
+    )
+    assert select_text_for_turn(mapping, anchor).status == "ambiguous"

@@ -302,7 +302,8 @@ def _resolve_user_node(mapping: dict, anchor: TurnAnchor) -> tuple[str | None, s
     """
     nodes = mapping.get("nodes") or mapping.get("mapping") or {}
 
-    # Primary: ID-based.
+    # Primary: ID-based. A client UUID may differ from the durable node id.
+    captured_missing = False
     if anchor.captured_user_message_id:
         target = anchor.captured_user_message_id
         for nid, node in nodes.items():
@@ -310,8 +311,10 @@ def _resolve_user_node(mapping: dict, anchor: TurnAnchor) -> tuple[str | None, s
                 continue
             if _node_id(node) == target or nid == target:
                 return nid, "id_match"
-        # ID was captured but not found in the projected window yet.
-        return None, "id_not_yet_in_mapping"
+        # Existing conversations must retain exact-ID fail-closed behavior.
+        if anchor.mode != "fresh_chat":
+            return None, "id_not_yet_in_mapping"
+        captured_missing = True
 
     # Fallback: text-based.
     matching = []
@@ -387,10 +390,21 @@ def _resolve_user_node(mapping: dict, anchor: TurnAnchor) -> tuple[str | None, s
         return None, "degraded_insufficient_evidence"
 
     if anchor.mode == "fresh_chat":
-        # Text-only; first/only match expected on a fresh chat.
+        # A mismatched captured UUID requires unique text AND time freshness.
+        if captured_missing and anchor.pre_send_wall_time is not None:
+            matching = [
+                (nid, node) for nid, node in matching
+                if _node_create_time(node) >=
+                anchor.pre_send_wall_time - SKEW_TOLERANCE_SECONDS
+            ]
         if len(matching) > 1:
             return None, "ambiguous"
-        return matching[0][0], "fresh_chat_text_match"
+        if not matching:
+            return None, "fresh_chat_no_unique_fresh_text_match"
+        return matching[0][0], (
+            "fresh_chat_unique_text_and_time_fallback"
+            if captured_missing else "fresh_chat_text_match"
+        )
 
     return None, f"unhandled_mode_{anchor.mode}"
 
