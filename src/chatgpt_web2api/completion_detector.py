@@ -494,6 +494,8 @@ class CompletionDetector:
         # shared account rate budget, and only fires when has_action is false
         # (so it never races the primary DOM signal). Never the sole signal.
         last_backend_check = 0.0
+        backend_poll_interval = 3.0
+        backend_rate_limit_streak = 0
         conv_id_for_check = d._current_conv_id or ""
         # Mid-loop conv_id probe throttle. On a NEW chat (REST /health path or
         # the SSE/MCP path) _current_conv_id is None here and conv_id_for_check
@@ -705,7 +707,7 @@ class CompletionDetector:
             if (
                 conv_id_for_check
                 and (last_dom_text or saw_thinking or is_thinking or had_non_text_content)
-                and time.monotonic() - last_backend_check > 3.0
+                and time.monotonic() - last_backend_check > backend_poll_interval
             ):
                 last_backend_check = time.monotonic()
                 try:
@@ -737,12 +739,29 @@ class CompletionDetector:
                             conv_id_for_check,
                         )
                     elif status == "fetch_failed":
-                        backend_fetch_failed = True
-                        logger.debug(
-                            "end_turn fetch failed (status=%s): %s",
-                            end_result.status, end_result.diagnostic,
-                        )
-                    # else: not_ready — no-op (do NOT set backend_fetch_failed).
+                        if (end_result.diagnostic or {}).get("rate_limited") is True:
+                            # 429 is a rate limit, NOT permission to accept a
+                            # possibly stale DOM action row as terminal.
+                            backend_rate_limit_streak += 1
+                            backend_poll_interval = min(
+                                24.0, 3.0 * 2 ** min(backend_rate_limit_streak, 3)
+                            )
+                            logger.debug(
+                                "projection rate limited; backoff %.1fs",
+                                backend_poll_interval,
+                            )
+                        else:
+                            backend_fetch_failed = True
+                            backend_rate_limit_streak = 0
+                            backend_poll_interval = 3.0
+                            logger.debug(
+                                "end_turn fetch failed (status=%s): %s",
+                                end_result.status, end_result.diagnostic,
+                            )
+                    else:
+                        # Backend answered normally: restore ordinary cadence.
+                        backend_rate_limit_streak = 0
+                        backend_poll_interval = 3.0
                 except AuthExpiredError:
                     # Auth failure must NEVER degrade to DOM fallback.
                     # (PR #39 review finding #2 — the prior broad except

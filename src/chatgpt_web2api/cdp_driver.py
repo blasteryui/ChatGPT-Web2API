@@ -348,6 +348,17 @@ def parse_retry_after(text: str, default: int = RATE_LIMIT_DEFAULT_RETRY_AFTER) 
     return default
 
 
+def projection_tail_delay(status: str, diagnostic: dict | None, previous_streak: int):
+    """Wait between post-Send projection READS. This never resends a message."""
+    limited = (status == "fetch_failed"
+               and isinstance(diagnostic, dict)
+               and diagnostic.get("rate_limited") is True)
+    if not limited:
+        return 0.5, 0, False
+    streak = min(max(previous_streak, 0) + 1, 4)
+    return min(16.0, 2.0 * (2.0 ** (streak - 1))), streak, True
+
+
 class CDPDriver:
     """Chrome DevTools Protocol driver for ChatGPT automation."""
 
@@ -2035,7 +2046,13 @@ class CDPDriver:
                 had_non_text_content = self._completion.had_non_text_content
                 last_status = "not_ready"
                 last_diagnostic = {}
-                for _ in range(60):
+                # Read back the ALREADY-submitted turn, never click Send again.
+                # 429 previously caused 60 projection GETs at 0.5s intervals.
+                projection_started = time.monotonic()
+                projection_budget = 30.0
+                rate_limit_streak = 0
+                terminal_text_matched = False
+                for _ in range(80):
                     result = await self._fetch_text_for_turn(conv_id, turn_anchor)
                     last_status = result.status
                     last_diagnostic = result.diagnostic or {}
@@ -2044,24 +2061,29 @@ class CDPDriver:
                             yield StreamChunk(delta=result.text[len(last_dom_text):])
                             last_dom_text = result.text
                         final_text = result.text
+                        terminal_text_matched = True
                         break
-                    if result.status == "non_text":
-                        pass
-                    if result.status in ("ambiguous", "degraded_not_fresh", "fetch_failed"):
-                        pass
-                    await asyncio.sleep(0.5)
-                else:
-                    if last_status != "non_text":
-                        raise TurnReconciliationError(
-                            conversation_id=conv_id,
-                            anchor_mode=turn_anchor.mode,
-                            last_status=last_status,
-                            diagnostic={
-                                "captured_id": turn_anchor.captured_user_message_id,
-                                "had_non_text_content": had_non_text_content,
-                                "last_fetch_diagnostic": last_diagnostic,
-                            },
-                        )
+                    delay, rate_limit_streak, limited = projection_tail_delay(
+                        last_status, last_diagnostic, rate_limit_streak
+                    )
+                    if limited:
+                        # Only proven rate-limiting extends reads to 120s.
+                        projection_budget = 120.0
+                    remaining = projection_budget - (time.monotonic() - projection_started)
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(delay, remaining))
+                if not terminal_text_matched and last_status != "non_text":
+                    raise TurnReconciliationError(
+                        conversation_id=conv_id,
+                        anchor_mode=turn_anchor.mode,
+                        last_status=last_status,
+                        diagnostic={
+                            "captured_id": turn_anchor.captured_user_message_id,
+                            "had_non_text_content": had_non_text_content,
+                            "last_fetch_diagnostic": last_diagnostic,
+                        },
+                    )
                 if not last_dom_text and had_non_text_content:
                     placeholder = (
                         "[Non-text response generated (image/tool-use/etc.) — "

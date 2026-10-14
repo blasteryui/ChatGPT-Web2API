@@ -393,7 +393,7 @@ class BackendClient:
             return TurnTextResult("not_ready", diagnostic={"reason": "transient_404"})
         except (CDPJSError, RuntimeError) as e:
             # Transport/backend failure — caller keeps polling.
-            return TurnTextResult("fetch_failed", diagnostic={"error": str(e)})
+            return TurnTextResult("fetch_failed", diagnostic={"error": str(e), "rate_limited": "projection HTTP 429" in str(e)})
 
     async def _fetch_end_turn_for_turn(
         self, conversation_id: str, anchor, *, had_non_text_content: bool
@@ -420,7 +420,7 @@ class BackendClient:
         except _Transient404:
             return TurnEndResult("not_ready", diagnostic={"reason": "transient_404"})
         except (CDPJSError, RuntimeError) as e:
-            return TurnEndResult("fetch_failed", diagnostic={"error": str(e)})
+            return TurnEndResult("fetch_failed", diagnostic={"error": str(e), "rate_limited": "projection HTTP 429" in str(e)})
 
     # ── Backend API: Models & Projects ─────────────────────────
 
