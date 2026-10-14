@@ -49,6 +49,7 @@ class StreamChunk:
 
     delta: str
     finish_reason: str | None = None
+    provider_receipt: dict | None = None
 
 
 # Conservative fallback wait (seconds) when ChatGPT's pop-up gives no exact
@@ -2100,7 +2101,10 @@ class CDPDriver:
             if capture_scope is not None:
                 capture_scope.close()
 
-        yield StreamChunk(delta="", finish_reason="stop")
+        yield StreamChunk(
+            delta="", finish_reason="stop",
+            provider_receipt=receipt.to_dict() if receipt is not None else None,
+        )
 
     async def _fetch_text_for_turn(self, conversation_id: str, anchor):
         """A2 anchored final-text fetch. Delegated to BackendClient.

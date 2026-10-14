@@ -40,6 +40,37 @@ from .resilience import retry_on_rate_limit
 
 logger = logging.getLogger(__name__)
 
+def _validated_terminal_receipt(receipt: dict | None, context: ProviderOperationContext, conversation_id: str) -> dict:
+    """Accept only the terminal receipt carried by THIS send iterator.
+
+    Driver-global last-receipt state belongs to no particular concurrent request.
+    A mismatch after an attempted send is uncertain, never a completed receipt.
+    """
+    if not isinstance(receipt, dict):
+        raise RuntimeError("strict provider missing request-local terminal receipt")
+    if (
+        receipt.get("operation_id") != context.operation_id
+        or receipt.get("requested_project_id") != context.requested_project_id
+        or receipt.get("observed_project_id") != context.observed_project_id
+        or (context.requested_project_id and context.observed_project_id != context.requested_project_id)
+        or not conversation_id
+        or receipt.get("conversation_id") != conversation_id
+        or not receipt.get("target_id")
+        or not receipt.get("session_identity")
+        or receipt.get("response_status") != "COMPLETE"
+        or receipt.get("effect_certainty") != "CONFIRMED_COMPLETE"
+    ):
+        raise RuntimeError("strict provider terminal receipt identity/certainty mismatch")
+    anchor = receipt.get("turn_anchor")
+    if not isinstance(anchor, dict) or not (
+        receipt.get("captured_user_message_id")
+        or anchor.get("captured_user_message_id")
+        or anchor.get("latest_user_node_id")
+    ):
+        raise RuntimeError("strict provider terminal receipt has no user turn anchor")
+    return dict(receipt)
+
+
 # Model mapping: user-facing names → ChatGPT web slugs
 MODEL_MAP = {
     "gpt-5.5": "gpt-5-5",
@@ -750,23 +781,33 @@ class APIServer:
 
         budgets = DetectorBudgets.from_config(self._config.chatgpt, model)
 
-        async def _send_and_collect() -> str:
+        async def _send_and_collect() -> tuple[str, dict | None]:
             collected = ""
+            terminal_receipt = None
             send_kwargs = {"timeout": timeout, "budgets": budgets, "model": model}
             if operation_context is not None:
                 send_kwargs["operation_context"] = operation_context
             async for chunk in self._driver.send_and_stream(text, **send_kwargs):
                 collected += chunk.delta
-            return collected
+                if operation_context is not None and chunk.finish_reason == "stop":
+                    terminal_receipt = _validated_terminal_receipt(
+                        chunk.provider_receipt, operation_context,
+                        self._driver._current_conv_id or "",
+                    )
+            return collected, terminal_receipt
 
         if operation_context is not None:
             # Strict provider mode never auto-replays a send. Any uncertain
             # post-submit outcome is returned with its receipt for reconciliation.
-            full_text = await _send_and_collect()
+            full_text, terminal_receipt = await _send_and_collect()
         else:
-            full_text = await retry_on_rate_limit(self._driver, _send_and_collect)
+            full_text, terminal_receipt = await retry_on_rate_limit(self._driver, _send_and_collect)
 
-        conv_id = self._driver._current_conv_id or ""
+        conv_id = (
+            terminal_receipt["conversation_id"]
+            if terminal_receipt is not None
+            else (self._driver._current_conv_id or "")
+        )
         self._last_conv_id = conv_id
         self._last_successful_send_at = time.time()
 
@@ -778,8 +819,8 @@ class APIServer:
                 "model": model,
                 "conversation_id": conv_id,
                 **(
-                    {"provider_receipt": self._driver._last_provider_receipt.to_dict()}
-                    if operation_context is not None and self._driver._last_provider_receipt
+                    {"provider_receipt": terminal_receipt}
+                    if terminal_receipt is not None
                     else {}
                 ),
                 "choices": [
@@ -903,6 +944,13 @@ class APIServer:
                     )
                 if chunk.finish_reason:
                     conv_id = self._driver._current_conv_id or ""
+                    terminal_receipt = (
+                        _validated_terminal_receipt(
+                            chunk.provider_receipt, operation_context, conv_id
+                        )
+                        if operation_context is not None and chunk.finish_reason == "stop"
+                        else None
+                    )
                     self._last_conv_id = conv_id
                     if chunk.finish_reason == "stop":
                         self._last_successful_send_at = time.time()
@@ -915,8 +963,8 @@ class APIServer:
                             "model": model,
                             "conversation_id": conv_id,
                             **(
-                                {"provider_receipt": self._driver._last_provider_receipt.to_dict()}
-                                if operation_context is not None and self._driver._last_provider_receipt
+                                {"provider_receipt": terminal_receipt}
+                                if terminal_receipt is not None
                                 else {}
                             ),
                             "choices": [
