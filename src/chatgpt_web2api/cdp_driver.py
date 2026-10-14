@@ -357,7 +357,12 @@ def projection_tail_delay(status: str, diagnostic: dict | None, previous_streak:
     if not limited:
         return 0.5, 0, False
     streak = min(max(previous_streak, 0) + 1, 4)
-    return min(16.0, 2.0 * (2.0 ** (streak - 1))), streak, True
+    delay = min(16.0, 2.0 * (2.0 ** (streak - 1)))
+    from .backend_client import projection_retry_after_seconds
+    server_wait = projection_retry_after_seconds(diagnostic.get("retry_after_seconds"))
+    if server_wait is not None:
+        delay = max(delay, server_wait)
+    return delay, streak, True
 
 
 class CDPDriver:

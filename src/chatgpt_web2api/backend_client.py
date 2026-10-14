@@ -37,6 +37,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 import time
 
 from .breakers import BreakerKind
@@ -66,6 +69,33 @@ class _Transient404(Exception):
 TOKEN_TTL_SECONDS = 3600
 
 
+def projection_retry_after_seconds(value, *, now=None):
+    """Parse a server READ cooldown; never authorizes retrying a provider Send."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        try:
+            parsed = parsedate_to_datetime(str(value))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            seconds = max(0.0, parsed.timestamp() - (time.time() if now is None else now))
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
+
+
+def _projection_failure_diagnostic(error):
+    limited = (isinstance(error, BackendHTTPError) and error.status == 429
+               or "projection HTTP 429" in str(error))
+    diagnostic = {"error": str(error), "rate_limited": limited}
+    if limited and isinstance(error, BackendHTTPError):
+        seconds = projection_retry_after_seconds(error.retry_after)
+        diagnostic["retry_after_seconds"] = 60.0 if seconds is None else seconds
+    return diagnostic
+
+
 class BackendClient:
     """Backend-api fetch helpers, composed by ``CDPDriver``.
 
@@ -77,6 +107,7 @@ class BackendClient:
 
     def __init__(self, driver) -> None:
         self._driver = driver
+        self._projection_retry_not_before = 0.0
 
     def _decode_backend_json_response(self, raw: str, endpoint: str):
         """Decode a status-preserving backend fetch envelope.
@@ -323,6 +354,12 @@ class BackendClient:
         from .cdp_driver import AuthExpiredError, CDPJSError
 
         d = self._driver
+        remaining = self._projection_retry_not_before - time.monotonic()
+        if remaining > 0:
+            # Both completion-status and final-text consumers share this gate.
+            # No HTTP call, token refresh or browser mutation before it expires.
+            raise BackendHTTPError("projection " + conversation_id, 429,
+                                   "read cooldown active", retry_after=str(remaining))
         await self._driver.ensure_token()
         raw = await d._js_with_data_strict(
             CONVERSATION_PROJECTION_JS,
@@ -348,6 +385,14 @@ class BackendClient:
                 raise AuthExpiredError()
             if status == 404:
                 raise _Transient404(conversation_id)
+            if status == 429:
+                retry_after = payload.get("retry_after")
+                seconds = projection_retry_after_seconds(retry_after)
+                seconds = 60.0 if seconds is None else seconds
+                self._projection_retry_not_before = max(
+                    self._projection_retry_not_before, time.monotonic() + seconds)
+                raise BackendHTTPError("projection " + conversation_id, 429,
+                                       retry_after=str(seconds))
             if status is not None:
                 raise RuntimeError(f"projection HTTP {status} for {conversation_id}")
         # Decode projection JS errors (the JS catches exceptions and returns
@@ -393,7 +438,7 @@ class BackendClient:
             return TurnTextResult("not_ready", diagnostic={"reason": "transient_404"})
         except (CDPJSError, RuntimeError) as e:
             # Transport/backend failure — caller keeps polling.
-            return TurnTextResult("fetch_failed", diagnostic={"error": str(e), "rate_limited": "projection HTTP 429" in str(e)})
+            return TurnTextResult("fetch_failed", diagnostic=_projection_failure_diagnostic(e))
 
     async def _fetch_end_turn_for_turn(
         self, conversation_id: str, anchor, *, had_non_text_content: bool
@@ -420,7 +465,7 @@ class BackendClient:
         except _Transient404:
             return TurnEndResult("not_ready", diagnostic={"reason": "transient_404"})
         except (CDPJSError, RuntimeError) as e:
-            return TurnEndResult("fetch_failed", diagnostic={"error": str(e), "rate_limited": "projection HTTP 429" in str(e)})
+            return TurnEndResult("fetch_failed", diagnostic=_projection_failure_diagnostic(e))
 
     # ── Backend API: Models & Projects ─────────────────────────
 

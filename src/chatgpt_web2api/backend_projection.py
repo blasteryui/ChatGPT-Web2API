@@ -44,7 +44,7 @@ CONVERSATION_PROJECTION_JS = """
     var r = await fetch('/backend-api/conversation/' + __D.conv_id + '?offset=0&limit=' + __D.limit, {
       headers: {'Authorization': 'Bearer ' + __D.token}
     });
-    if (!r.ok) return JSON.stringify({__status: r.status});
+    if (!r.ok) return JSON.stringify({__status: r.status, retry_after: r.headers ? r.headers.get('retry-after') : null});
     var conv = await r.json();
     var mapping = conv.mapping || {};
     var projected = {};
