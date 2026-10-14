@@ -146,3 +146,56 @@ async def test_strict_rest_endpoint_refuses_busy_before_any_driver_action(monkey
     assert payload["error"]["code"] == "lock_timeout"
     assert "mutation_busy_before_send" in payload["error"]["message"]
     assert driver.called == []
+    assert payload["not_started_receipt"] == {
+        "operation_id": "VISION_SHEPHERD_fire_test_no_send",
+        "requested_project_id": "g-p-6abc5b56d4488191b9b5b5224e3ef10c",
+        "effect_certainty": "CONFIRMED_NOT_STARTED",
+        "reason": "mutation_busy_before_send",
+    }
+
+
+@pytest.mark.asyncio
+async def test_error_after_lock_entry_cannot_claim_not_started(monkeypatch):
+    """A later exception of the same class must not fabricate a pre-Send proof."""
+    import json
+    from types import SimpleNamespace
+    from chatgpt_web2api.api_server import APIServer
+
+    monkeypatch.setattr(lr, "CrossProcessLock", NullFileLock)
+
+    class Driver:
+        async def navigate_new_chat(self, **kwargs):
+            raise LockAcquisitionError("simulated_late_exception")
+
+    class Request:
+        headers = {}
+        query = {}
+
+        async def json(self):
+            return {
+                "model": "auto", "strict_provider": True,
+                "project_id": "g-p-6abc5b56d4488191b9b5b5224e3ef10c",
+                "operation_id": "VISION_SHEPHERD_fire_late_error",
+                "messages": [{"role": "user", "content": "offline-only"}],
+                "stream": False,
+            }
+
+    config = SimpleNamespace(
+        chrome=SimpleNamespace(cdp_port=19887),
+        chatgpt=SimpleNamespace(
+            parallel_tabs=False, default_model="auto",
+            default_project_id=None,
+        ),
+        server=SimpleNamespace(api_keys=[], request_timeout=60),
+    )
+    server = APIServer(config, Driver())
+
+    async def no_breaker():
+        return None
+
+    monkeypatch.setattr(server, "_check_circuit_or_recover", no_breaker)
+    response = await server._handle_chat(Request())
+    assert response.status == 503
+    payload = json.loads(response.text)
+    assert payload["error"]["code"] == "lock_timeout"
+    assert "not_started_receipt" not in payload

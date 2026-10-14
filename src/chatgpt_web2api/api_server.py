@@ -403,6 +403,8 @@ class APIServer:
             full_text,
         )
 
+        mutation_lock_acquired = False
+
         # Serialize — cross-process lock so MCP + REST don't corrupt each other
         try:
             # Circuit-open fail-fast (Phase 4 PR2): refuse before touching Chrome
@@ -426,6 +428,7 @@ class APIServer:
             else:
                 _port, _key = self._cdp_port, None
             async with MutationLock(_port, _key, fail_if_busy=strict_provider):
+                mutation_lock_acquired = True
                 # Drift guard (parallel mode only): if the owned target changed
                 # while we waited for the lock, the key we hold no longer names
                 # the active tab. Fail retryably instead of mutating under a
@@ -519,6 +522,27 @@ class APIServer:
         except Exception as e:
             logger.error("Chat error: %s", e, exc_info=True)
             self._last_error = f"{type(e).__name__}: {e}"
+            # Only a strict rejection before entering the mutation lock is
+            # provably pre-navigation/pre-Send. Do not make this claim for a
+            # later error, even when its exception class is identical.
+            if strict_provider and not mutation_lock_acquired and isinstance(e, LockAcquisitionError):
+                return web.json_response(
+                    {
+                        "error": {
+                            "message": str(e),
+                            "type": "server_error",
+                            "param": None,
+                            "code": "lock_timeout",
+                        },
+                        "not_started_receipt": {
+                            "operation_id": operation_id,
+                            "requested_project_id": project_id,
+                            "effect_certainty": "CONFIRMED_NOT_STARTED",
+                            "reason": "mutation_busy_before_send",
+                        },
+                    },
+                    status=503,
+                )
             return self._error_response(e)
 
     async def _check_circuit_or_recover(self) -> None:
