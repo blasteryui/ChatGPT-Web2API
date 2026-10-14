@@ -789,6 +789,19 @@ class APIServer:
                 send_kwargs["operation_context"] = operation_context
             async for chunk in self._driver.send_and_stream(text, **send_kwargs):
                 collected += chunk.delta
+                if chunk.finish_reason == "stop" and chunk.final_text is not None:
+                    # DOM observations may be rewritten between progress updates.
+                    # Only the anchored terminal answer is the full response.
+                    if not isinstance(chunk.final_text, str):
+                        raise RuntimeError("invalid authoritative terminal response text")
+                    if operation_context is not None:
+                        import hashlib
+                        raw_receipt = chunk.provider_receipt
+                        expected = raw_receipt.get("response_sha256") if isinstance(raw_receipt, dict) else None
+                        actual = hashlib.sha256(chunk.final_text.encode("utf-8")).hexdigest()
+                        if expected != actual:
+                            raise RuntimeError("strict provider terminal response hash mismatch")
+                    collected = chunk.final_text
                 if operation_context is not None and chunk.finish_reason == "stop":
                     terminal_receipt = _validated_terminal_receipt(
                         chunk.provider_receipt, operation_context,
