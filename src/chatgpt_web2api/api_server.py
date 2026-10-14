@@ -503,6 +503,7 @@ class APIServer:
                     self._last_conv_id
                     and self._driver._current_conv_id == self._last_conv_id
                     and project_id == self._last_project_id
+                    and not strict_provider  # strict requests without an explicit ID are fresh
                     and not system_parts
                 ):
                     # Same session, same project, no system prompt override — continue.
