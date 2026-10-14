@@ -372,6 +372,26 @@ class CompletionDetector:
         phase1_conv_id = ""
         last_conv_id_probe = 0.0
         last_backend_probe = 0.0
+
+        async def final_phase1_terminal_text() -> str:
+            """One last turn-anchored readback before declaring Phase-1 failed.
+
+            A terminal answer may arrive after the last three-second poll but
+            before the stall/deadline boundary. This never retries Send.
+            """
+            try:
+                current_id = await d._get_live_conversation_id_best_effort()
+                target_id = current_id or phase1_conv_id
+                if target_id:
+                    terminal = await d._fetch_text_for_turn(target_id, turn_anchor)
+                    if terminal.status == "matched" and terminal.text:
+                        return terminal.text
+            except AuthExpiredError:
+                raise
+            except Exception as exc:
+                logger.debug("Phase-1 final terminal probe failed: %s", exc)
+            return ""
+
         while time.monotonic() < deadline:
             # First check for ChatGPT's rate-limit pop-up — if present, fail
             # fast with a clear error instead of waiting out the whole timeout.
@@ -445,9 +465,19 @@ class CompletionDetector:
                     logger.debug("Phase-1 backend completion probe failed: %s", e)
 
             if time.monotonic() - last_progress > phase1_stall_budget:
+                final_text = await final_phase1_terminal_text()
+                if final_text:
+                    self.last_dom_text = final_text
+                    yield StreamChunk(delta=final_text)
+                    return
                 raise GenerationStuckError("phase_1_appear", time.monotonic() - last_progress)
             await asyncio.sleep(0.5)
         else:
+            final_text = await final_phase1_terminal_text()
+            if final_text:
+                self.last_dom_text = final_text
+                yield StreamChunk(delta=final_text)
+                return
             raise GenerationStuckError("phase_1_appear", timeout)
 
         logger.info("Assistant message appeared, waiting for completion...")
