@@ -425,7 +425,7 @@ class APIServer:
                 _port, _key = resolve_mutation_lock(self._driver, True)
             else:
                 _port, _key = self._cdp_port, None
-            async with MutationLock(_port, _key):
+            async with MutationLock(_port, _key, fail_if_busy=strict_provider):
                 # Drift guard (parallel mode only): if the owned target changed
                 # while we waited for the lock, the key we hold no longer names
                 # the active tab. Fail retryably instead of mutating under a

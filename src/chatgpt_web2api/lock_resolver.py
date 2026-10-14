@@ -33,7 +33,7 @@ import asyncio
 import threading
 from typing import TYPE_CHECKING
 
-from .cross_process_lock import CrossProcessLock, target_lock_key
+from .cross_process_lock import CrossProcessLock, LockAcquisitionError, target_lock_key
 
 if TYPE_CHECKING:
     from .cdp_driver import CDPDriver
@@ -100,11 +100,17 @@ class MutationLock:
     MutationLock must never be held at the same time.
     """
 
-    def __init__(self, cdp_port: int, lock_key: str | None = None) -> None:
+    def __init__(self, cdp_port: int, lock_key: str | None = None, *, fail_if_busy: bool = False) -> None:
         self._proc_lock = _proc_lock_for(cdp_port, lock_key)
-        self._file_lock = CrossProcessLock(cdp_port=cdp_port, lock_key=lock_key)
+        self._fail_if_busy = fail_if_busy
+        self._file_lock = (
+            CrossProcessLock(cdp_port=cdp_port, lock_key=lock_key, timeout=0.0)
+            if fail_if_busy else CrossProcessLock(cdp_port=cdp_port, lock_key=lock_key)
+        )
 
     async def __aenter__(self) -> MutationLock:
+        if self._fail_if_busy and self._proc_lock.locked():
+            raise LockAcquisitionError("mutation_busy_before_send")
         await self._proc_lock.acquire()
         try:
             await self._file_lock.__aenter__()
