@@ -414,10 +414,17 @@ class CompletionDetector:
             # conversation id is available and at the same bounded cadence as
             # Phase 2; a matched terminal backend answer is authoritative.
             now = time.monotonic()
-            if not phase1_conv_id and now - last_conv_id_probe >= 1.0:
+            # An SPA may initially expose the previous chat's URL while the
+            # newly sent turn navigates. Recheck the *read-only* live identity
+            # instead of permanently latching the first nonempty ID; the
+            # turn anchor still decides whether any terminal text is ours.
+            if now - last_conv_id_probe >= 1.0:
                 last_conv_id_probe = now
                 try:
-                    phase1_conv_id = await d._get_live_conversation_id_best_effort()
+                    observed_conv_id = await d._get_live_conversation_id_best_effort()
+                    if observed_conv_id and observed_conv_id != phase1_conv_id:
+                        phase1_conv_id = observed_conv_id
+                        last_backend_probe = 0.0
                 except Exception as e:
                     logger.debug("Phase-1 conversation-id probe failed: %s", e)
             if phase1_conv_id and now - last_backend_probe >= 3.0:
