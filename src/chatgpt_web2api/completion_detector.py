@@ -338,6 +338,11 @@ class CompletionDetector:
         model_class = classify_model(model) if model else "default"
         # P1: budgets default to legacy behavior when not provided (back-compat).
         use_two_state = budgets is not None
+        # Before the assistant DOM node exists, silent reasoning still needs the
+        # same first-content budget as Phase 2; preserve legacy when absent.
+        phase1_stall_budget = (
+            budgets.first_content_timeout_seconds if budgets else PHASE_STALL_SECONDS
+        )
 
         # Reset per-call results surfaced to the driver tail.
         self.last_dom_text = ""
@@ -423,7 +428,7 @@ class CompletionDetector:
                 except Exception as e:
                     logger.debug("Phase-1 backend completion probe failed: %s", e)
 
-            if time.monotonic() - last_progress > PHASE_STALL_SECONDS:
+            if time.monotonic() - last_progress > phase1_stall_budget:
                 raise GenerationStuckError("phase_1_appear", time.monotonic() - last_progress)
             await asyncio.sleep(0.5)
         else:
