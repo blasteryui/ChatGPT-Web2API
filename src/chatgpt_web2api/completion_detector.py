@@ -189,6 +189,15 @@ class DetectorBudgets:
         uses the reasoning first-content/stream-idle budgets; otherwise default.
         The hard cap is shared across both classes.
         """
+        # "auto" is an account-default selector, not an observed model identity.
+        # It can select a reasoning model: allow its silent first-content budget
+        # while preserving default stream-idle and the existing absolute cap.
+        if (model or "").strip().lower() == "auto":
+            return cls(
+                first_content_timeout_seconds=config.detector_reasoning_first_content_timeout_seconds,
+                stream_idle_timeout_seconds=config.detector_default_stream_idle_timeout_seconds,
+                hard_timeout_seconds=config.detector_hard_timeout_seconds,
+            )
         if classify_model(model) == "reasoning":
             return cls(
                 first_content_timeout_seconds=config.detector_reasoning_first_content_timeout_seconds,
