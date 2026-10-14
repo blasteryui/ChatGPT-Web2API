@@ -445,6 +445,8 @@ class CompletionDetector:
                     if observed_conv_id and observed_conv_id != phase1_conv_id:
                         phase1_conv_id = observed_conv_id
                         last_backend_probe = 0.0
+                except AuthExpiredError:
+                    raise
                 except Exception as e:
                     logger.debug("Phase-1 conversation-id probe failed: %s", e)
             if phase1_conv_id and now - last_backend_probe >= 3.0:
