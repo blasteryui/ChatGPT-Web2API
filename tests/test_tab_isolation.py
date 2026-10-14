@@ -49,6 +49,11 @@ def _mock_ws_connect(fake_ws=None):
 
 def _make_driver():
     d = CDPDriver(cdp_port=9222)
+    # Fake the CDP-side effects: tab ownership tests never contact Chrome.
+    # Registry reclaim and listener/send-readiness have separate coverage.
+    d._tab_registry = None
+    d._attach_identity_listener = AsyncMock()
+    d._ensure_send_ready = AsyncMock()
     d._access_token = "tok"
     d._token_fetched_at = time.time()
     return d

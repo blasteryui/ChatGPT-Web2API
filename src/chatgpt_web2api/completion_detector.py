@@ -189,6 +189,15 @@ class DetectorBudgets:
         uses the reasoning first-content/stream-idle budgets; otherwise default.
         The hard cap is shared across both classes.
         """
+        # "auto" is an account-default selector, not an observed model identity.
+        # It can select a reasoning model: allow its silent first-content budget
+        # while preserving default stream-idle and the existing absolute cap.
+        if (model or "").strip().lower() == "auto":
+            return cls(
+                first_content_timeout_seconds=config.detector_reasoning_first_content_timeout_seconds,
+                stream_idle_timeout_seconds=config.detector_default_stream_idle_timeout_seconds,
+                hard_timeout_seconds=config.detector_hard_timeout_seconds,
+            )
         if classify_model(model) == "reasoning":
             return cls(
                 first_content_timeout_seconds=config.detector_reasoning_first_content_timeout_seconds,
@@ -338,6 +347,11 @@ class CompletionDetector:
         model_class = classify_model(model) if model else "default"
         # P1: budgets default to legacy behavior when not provided (back-compat).
         use_two_state = budgets is not None
+        # Before the assistant DOM node exists, silent reasoning still needs the
+        # same first-content budget as Phase 2; preserve legacy when absent.
+        phase1_stall_budget = (
+            budgets.first_content_timeout_seconds if budgets else PHASE_STALL_SECONDS
+        )
 
         # Reset per-call results surfaced to the driver tail.
         self.last_dom_text = ""
@@ -355,6 +369,29 @@ class CompletionDetector:
         deadline = time.monotonic() + timeout
         last_node_count = initial_count
         last_progress = time.monotonic()
+        phase1_conv_id = ""
+        last_conv_id_probe = 0.0
+        last_backend_probe = 0.0
+
+        async def final_phase1_terminal_text() -> str:
+            """One last turn-anchored readback before declaring Phase-1 failed.
+
+            A terminal answer may arrive after the last three-second poll but
+            before the stall/deadline boundary. This never retries Send.
+            """
+            try:
+                current_id = await d._get_live_conversation_id_best_effort()
+                target_id = current_id or phase1_conv_id
+                if target_id:
+                    terminal = await d._fetch_text_for_turn(target_id, turn_anchor)
+                    if terminal.status == "matched" and terminal.text:
+                        return terminal.text
+            except AuthExpiredError:
+                raise
+            except Exception as exc:
+                logger.debug("Phase-1 final terminal probe failed: %s", exc)
+            return ""
+
         while time.monotonic() < deadline:
             # First check for ChatGPT's rate-limit pop-up — if present, fail
             # fast with a clear error instead of waiting out the whole timeout.
@@ -377,7 +414,7 @@ class CompletionDetector:
 
             try:
                 raw = await d._js_strict(
-                    "document.querySelectorAll('[data-message-author-role=\"assistant\"]').length"
+                    "document.querySelectorAll('[data-message-author-role=\"assistant\"], [data-chatgpt-selection-message-id]').length"
                 )
                 current_count = int(raw or 0)
             except CDPJSError:
@@ -389,10 +426,60 @@ class CompletionDetector:
                 last_progress = time.monotonic()
             if current_count > initial_count:
                 break
-            if time.monotonic() - last_progress > PHASE_STALL_SECONDS:
+
+            # The rendered assistant node is a UI detail, not proof that the
+            # submitted turn failed. Some ChatGPT layouts delay or omit that
+            # node while the authenticated conversation mapping already has
+            # the terminal, turn-anchored assistant answer. Probe only after a
+            # conversation id is available and at the same bounded cadence as
+            # Phase 2; a matched terminal backend answer is authoritative.
+            now = time.monotonic()
+            # An SPA may initially expose the previous chat's URL while the
+            # newly sent turn navigates. Recheck the *read-only* live identity
+            # instead of permanently latching the first nonempty ID; the
+            # turn anchor still decides whether any terminal text is ours.
+            if now - last_conv_id_probe >= 1.0:
+                last_conv_id_probe = now
+                try:
+                    observed_conv_id = await d._get_live_conversation_id_best_effort()
+                    if observed_conv_id and observed_conv_id != phase1_conv_id:
+                        phase1_conv_id = observed_conv_id
+                        last_backend_probe = 0.0
+                except AuthExpiredError:
+                    raise
+                except Exception as e:
+                    logger.debug("Phase-1 conversation-id probe failed: %s", e)
+            if phase1_conv_id and now - last_backend_probe >= 3.0:
+                last_backend_probe = now
+                try:
+                    backend_text = await d._fetch_text_for_turn(phase1_conv_id, turn_anchor)
+                    if backend_text.status == "matched" and backend_text.text:
+                        self.last_dom_text = backend_text.text
+                        logger.info(
+                            "Phase-1 appearance bypassed by turn-anchored backend completion for %s",
+                            phase1_conv_id,
+                        )
+                        yield StreamChunk(delta=backend_text.text)
+                        return
+                except AuthExpiredError:
+                    raise
+                except Exception as e:
+                    logger.debug("Phase-1 backend completion probe failed: %s", e)
+
+            if time.monotonic() - last_progress > phase1_stall_budget:
+                final_text = await final_phase1_terminal_text()
+                if final_text:
+                    self.last_dom_text = final_text
+                    yield StreamChunk(delta=final_text)
+                    return
                 raise GenerationStuckError("phase_1_appear", time.monotonic() - last_progress)
             await asyncio.sleep(0.5)
         else:
+            final_text = await final_phase1_terminal_text()
+            if final_text:
+                self.last_dom_text = final_text
+                yield StreamChunk(delta=final_text)
+                return
             raise GenerationStuckError("phase_1_appear", timeout)
 
         logger.info("Assistant message appeared, waiting for completion...")
@@ -460,6 +547,8 @@ class CompletionDetector:
         # shared account rate budget, and only fires when has_action is false
         # (so it never races the primary DOM signal). Never the sole signal.
         last_backend_check = 0.0
+        backend_poll_interval = 3.0
+        backend_rate_limit_streak = 0
         conv_id_for_check = d._current_conv_id or ""
         # Mid-loop conv_id probe throttle. On a NEW chat (REST /health path or
         # the SSE/MCP path) _current_conv_id is None here and conv_id_for_check
@@ -474,7 +563,7 @@ class CompletionDetector:
             try:
                 result = await d._js_strict(
                     "(function() {"
-                    "  var msgs = document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
+                    "  var msgs = document.querySelectorAll('[data-message-author-role=\"assistant\"], [data-chatgpt-selection-message-id]');"
                     "  if (!msgs.length) return JSON.stringify({text:'', md_text:'', html_len:0, child_count:0, has_action:false, is_thinking:false});"
                     "  var last = msgs[msgs.length - 1];"
                     # Text: the clean answer lives in ``.markdown`` textContent.
@@ -520,6 +609,7 @@ class CompletionDetector:
                     '            [data-testid*="copy"],'
                     '            [data-testid*="response-turn"]\';'
                     "  var has_action = (function() {"
+                    "    if(last.closest('[data-talvt-turn-state=complete]')) return true;"
                     "    var lastRect = last.getBoundingClientRect();"
                     "    var scope = last;"
                     "    for (var d = 0; scope && d <= 8; d++, scope = scope.parentElement) {"
@@ -670,7 +760,7 @@ class CompletionDetector:
             if (
                 conv_id_for_check
                 and (last_dom_text or saw_thinking or is_thinking or had_non_text_content)
-                and time.monotonic() - last_backend_check > 3.0
+                and time.monotonic() - last_backend_check > backend_poll_interval
             ):
                 last_backend_check = time.monotonic()
                 try:
@@ -702,12 +792,29 @@ class CompletionDetector:
                             conv_id_for_check,
                         )
                     elif status == "fetch_failed":
-                        backend_fetch_failed = True
-                        logger.debug(
-                            "end_turn fetch failed (status=%s): %s",
-                            end_result.status, end_result.diagnostic,
-                        )
-                    # else: not_ready — no-op (do NOT set backend_fetch_failed).
+                        if (end_result.diagnostic or {}).get("rate_limited") is True:
+                            # 429 is a rate limit, NOT permission to accept a
+                            # possibly stale DOM action row as terminal.
+                            backend_rate_limit_streak += 1
+                            backend_poll_interval = min(
+                                24.0, 3.0 * 2 ** min(backend_rate_limit_streak, 3)
+                            )
+                            logger.debug(
+                                "projection rate limited; backoff %.1fs",
+                                backend_poll_interval,
+                            )
+                        else:
+                            backend_fetch_failed = True
+                            backend_rate_limit_streak = 0
+                            backend_poll_interval = 3.0
+                            logger.debug(
+                                "end_turn fetch failed (status=%s): %s",
+                                end_result.status, end_result.diagnostic,
+                            )
+                    else:
+                        # Backend answered normally: restore ordinary cadence.
+                        backend_rate_limit_streak = 0
+                        backend_poll_interval = 3.0
                 except AuthExpiredError:
                     # Auth failure must NEVER degrade to DOM fallback.
                     # (PR #39 review finding #2 — the prior broad except

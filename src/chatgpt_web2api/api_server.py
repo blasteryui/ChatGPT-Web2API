@@ -28,9 +28,48 @@ from .cdp_driver import (
 from .config import Config
 from .cross_process_lock import LockAcquisitionError
 from .lock_resolver import MutationLock, OwnedTabRequiredError, resolve_mutation_lock
+from .provider_contract import (
+    BackendHTTPError,
+    ModelSelectionError,
+    ProjectPlacementError,
+    ProviderOperationContext,
+    ProviderOperationUncertainError,
+    RenameVerificationError,
+)
 from .resilience import retry_on_rate_limit
 
 logger = logging.getLogger(__name__)
+
+def _validated_terminal_receipt(receipt: dict | None, context: ProviderOperationContext, conversation_id: str) -> dict:
+    """Accept only the terminal receipt carried by THIS send iterator.
+
+    Driver-global last-receipt state belongs to no particular concurrent request.
+    A mismatch after an attempted send is uncertain, never a completed receipt.
+    """
+    if not isinstance(receipt, dict):
+        raise RuntimeError("strict provider missing request-local terminal receipt")
+    if (
+        receipt.get("operation_id") != context.operation_id
+        or receipt.get("requested_project_id") != context.requested_project_id
+        or receipt.get("observed_project_id") != context.observed_project_id
+        or (context.requested_project_id and context.observed_project_id != context.requested_project_id)
+        or not conversation_id
+        or receipt.get("conversation_id") != conversation_id
+        or not receipt.get("target_id")
+        or not receipt.get("session_identity")
+        or receipt.get("response_status") != "COMPLETE"
+        or receipt.get("effect_certainty") != "CONFIRMED_COMPLETE"
+    ):
+        raise RuntimeError("strict provider terminal receipt identity/certainty mismatch")
+    anchor = receipt.get("turn_anchor")
+    if not isinstance(anchor, dict) or not (
+        receipt.get("captured_user_message_id")
+        or anchor.get("captured_user_message_id")
+        or anchor.get("latest_user_node_id")
+    ):
+        raise RuntimeError("strict provider terminal receipt has no user turn anchor")
+    return dict(receipt)
+
 
 # Model mapping: user-facing names → ChatGPT web slugs
 MODEL_MAP = {
@@ -83,6 +122,11 @@ class APIServer:
         self.app.router.add_post("/chat/completions", self._handle_chat)
         self.app.router.add_get("/v1/models", self._handle_models)
         self.app.router.add_get("/v1/projects", self._handle_projects)
+        self.app.router.add_get("/v1/conversations/search", self._handle_conversation_search)
+        self.app.router.add_post("/v1/conversations/reconcile", self._handle_conversation_reconcile)
+        self.app.router.add_patch(
+            "/v1/conversations/{conversation_id}", self._handle_conversation_rename
+        )
         self.app.router.add_get("/health", self._handle_health)
         self.app.router.add_get("/", self._handle_health)
 
@@ -230,6 +274,71 @@ class APIServer:
             projects = []
         return web.json_response({"object": "list", "data": projects})
 
+    async def _handle_conversation_search(self, request: web.Request) -> web.Response:
+        if err := self._check_auth(request):
+            return err
+        query = (request.query.get("query") or "").strip()
+        if not query:
+            return web.json_response(
+                {"error": {"message": "query is required", "type": "invalid_request_error"}},
+                status=400,
+            )
+        cursor = request.query.get("cursor")
+        try:
+            result = await self._driver.search_conversations(query, cursor)
+        except Exception as exc:
+            return self._error_response(exc)
+        return web.json_response(result)
+
+    async def _handle_conversation_reconcile(self, request: web.Request) -> web.Response:
+        if err := self._check_auth(request):
+            return err
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response(
+                {"error": {"message": "Invalid JSON", "type": "invalid_request_error"}},
+                status=400,
+            )
+        query = str(body.get("query") or "").strip()
+        if not query:
+            return web.json_response(
+                {"error": {"message": "query is required", "type": "invalid_request_error"}},
+                status=400,
+            )
+        exact_user_text = body.get("exact_user_text")
+        try:
+            result = await self._driver.reconcile_conversation_turn(
+                query,
+                exact_user_text=str(exact_user_text) if exact_user_text is not None else None,
+            )
+        except Exception as exc:
+            return self._error_response(exc)
+        return web.json_response(result)
+
+    async def _handle_conversation_rename(self, request: web.Request) -> web.Response:
+        if err := self._check_auth(request):
+            return err
+        conversation_id = request.match_info["conversation_id"]
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response(
+                {"error": {"message": "Invalid JSON", "type": "invalid_request_error"}},
+                status=400,
+            )
+        title = str(body.get("title") or "")
+        if not title:
+            return web.json_response(
+                {"error": {"message": "title is required", "type": "invalid_request_error"}},
+                status=400,
+            )
+        try:
+            result = await self._driver.rename_conversation_verified(conversation_id, title)
+        except Exception as exc:
+            return self._error_response(exc)
+        return web.json_response(result)
+
     async def _handle_chat(self, request: web.Request) -> web.Response:
         if err := self._check_auth(request):
             return err
@@ -260,6 +369,14 @@ class APIServer:
             or self._config.chatgpt.default_project_id
         )
         conversation_id = body.get("conversation_id")
+        metadata = body.get("metadata", {}) or {}
+        strict_provider = bool(body.get("strict_provider") or metadata.get("strict_provider"))
+        strict_model_selection = strict_provider or bool(
+            body.get("strict_model_selection") or metadata.get("strict_model_selection")
+        )
+        operation_id = str(
+            body.get("operation_id") or metadata.get("operation_id") or uuid.uuid4()
+        )
 
         # Build conversation text from all messages
         # Includes prior assistant context for stateless clients (OpenAI SDK)
@@ -317,6 +434,8 @@ class APIServer:
             full_text,
         )
 
+        mutation_lock_acquired = False
+
         # Serialize — cross-process lock so MCP + REST don't corrupt each other
         try:
             # Circuit-open fail-fast (Phase 4 PR2): refuse before touching Chrome
@@ -339,7 +458,8 @@ class APIServer:
                 _port, _key = resolve_mutation_lock(self._driver, True)
             else:
                 _port, _key = self._cdp_port, None
-            async with MutationLock(_port, _key):
+            async with MutationLock(_port, _key, fail_if_busy=strict_provider):
+                mutation_lock_acquired = True
                 # Drift guard (parallel mode only): if the owned target changed
                 # while we waited for the lock, the key we hold no longer names
                 # the active tab. Fail retryably instead of mutating under a
@@ -356,23 +476,34 @@ class APIServer:
                 # already knowing the circuit is open.
                 await self._check_circuit_or_recover()
 
-                # Select model if specified (non-fatal on failure)
+                # Model selection is permissive by default for compatibility.
+                # Vision/provider mode is strict: positive observation is
+                # required before navigation or Send.
+                observed_model = None
                 if model_slug and model_slug != "auto":
-                    selected = await self._driver.select_model(model_slug)
-                    if not selected:
-                        logger.warning(
-                            "Could not select model '%s', proceeding with active model",
-                            model_slug,
-                        )
+                    if strict_model_selection:
+                        observed_model = await self._driver.select_model_verified(model_slug)
+                    else:
+                        selected = await self._driver.select_model(model_slug)
+                        if not selected:
+                            logger.warning(
+                                "Could not select model '%s', proceeding with active model",
+                                model_slug,
+                            )
+                elif model_slug == "auto":
+                    observed_model = "auto"
 
                 # Decide: continue existing conversation or start fresh?
                 if conversation_id:
                     # Explicit conversation_id from client — navigate to it
-                    await self._driver.navigate_conversation(conversation_id)
+                    await self._driver.navigate_conversation(
+                        conversation_id, project_id=project_id
+                    )
                 elif (
                     self._last_conv_id
                     and self._driver._current_conv_id == self._last_conv_id
                     and project_id == self._last_project_id
+                    and not strict_provider  # strict requests without an explicit ID are fresh
                     and not system_parts
                 ):
                     # Same session, same project, no system prompt override — continue.
@@ -387,14 +518,63 @@ class APIServer:
                     await self._driver.navigate_new_chat(gizmo_id=project_id)
                     self._last_project_id = project_id
 
+                observed_project = (
+                    await self._driver.observe_project_id(project_id) if project_id else None
+                )
+                if strict_provider and project_id and observed_project != project_id:
+                    raise ProjectPlacementError(project_id, observed_project)
+
+                operation_context = None
+                if strict_provider:
+                    operation_context = ProviderOperationContext(
+                        operation_id=operation_id,
+                        requested_project_id=project_id,
+                        requested_model=model_slug,
+                        observed_project_id=observed_project,
+                        observed_model=observed_model,
+                    )
+
                 if stream:
-                    return await self._stream_response(request, model_slug, full_text, timeout)
+                    return await self._stream_response(
+                        request,
+                        model_slug,
+                        full_text,
+                        timeout,
+                        operation_context=operation_context,
+                    )
                 else:
-                    return await self._full_response(request, model_slug, full_text, timeout)
+                    return await self._full_response(
+                        request,
+                        model_slug,
+                        full_text,
+                        timeout,
+                        operation_context=operation_context,
+                    )
 
         except Exception as e:
             logger.error("Chat error: %s", e, exc_info=True)
             self._last_error = f"{type(e).__name__}: {e}"
+            # Only a strict rejection before entering the mutation lock is
+            # provably pre-navigation/pre-Send. Do not make this claim for a
+            # later error, even when its exception class is identical.
+            if strict_provider and not mutation_lock_acquired and isinstance(e, LockAcquisitionError):
+                return web.json_response(
+                    {
+                        "error": {
+                            "message": str(e),
+                            "type": "server_error",
+                            "param": None,
+                            "code": "lock_timeout",
+                        },
+                        "not_started_receipt": {
+                            "operation_id": operation_id,
+                            "requested_project_id": project_id,
+                            "effect_certainty": "CONFIRMED_NOT_STARTED",
+                            "reason": "mutation_busy_before_send",
+                        },
+                    },
+                    status=503,
+                )
             return self._error_response(e)
 
     async def _check_circuit_or_recover(self) -> None:
@@ -437,6 +617,67 @@ class APIServer:
         - Everything else stays a 500 ``server_error`` (a real failure, not
           retriable).
         """
+        if isinstance(exc, ProviderOperationUncertainError):
+            return web.json_response(
+                {
+                    "error": {
+                        "message": str(exc),
+                        "type": "provider_effect_uncertain",
+                        "code": "delivery_uncertain",
+                    },
+                    "provider_receipt": exc.receipt.to_dict(),
+                },
+                status=409,
+            )
+        if isinstance(exc, BackendHTTPError):
+            status = exc.status if 400 <= exc.status <= 599 else 502
+            headers = {}
+            if exc.retry_after:
+                headers["Retry-After"] = str(exc.retry_after)
+            return web.json_response(
+                {
+                    "error": {
+                        "message": str(exc),
+                        "type": "backend_http_error",
+                        "code": "backend_http_error",
+                    }
+                },
+                status=status,
+                headers=headers,
+            )
+        if isinstance(exc, ModelSelectionError):
+            return web.json_response(
+                {
+                    "error": {
+                        "message": str(exc),
+                        "type": "provider_precondition_failed",
+                        "code": "model_verification_failed",
+                    }
+                },
+                status=409,
+            )
+        if isinstance(exc, ProjectPlacementError):
+            return web.json_response(
+                {
+                    "error": {
+                        "message": str(exc),
+                        "type": "provider_precondition_failed",
+                        "code": "project_verification_failed",
+                    }
+                },
+                status=409,
+            )
+        if isinstance(exc, RenameVerificationError):
+            return web.json_response(
+                {
+                    "error": {
+                        "message": str(exc),
+                        "type": "provider_verification_failed",
+                        "code": "rename_verification_failed",
+                    }
+                },
+                status=409,
+            )
         if isinstance(exc, RateLimitError):
             retry_after = str(int(exc.retry_after))
             return web.json_response(
@@ -521,7 +762,13 @@ class APIServer:
     # ── Response formatters ───────────────────────────────────
 
     async def _full_response(
-        self, request: web.Request, model: str, text: str, timeout: float
+        self,
+        request: web.Request,
+        model: str,
+        text: str,
+        timeout: float,
+        *,
+        operation_context: ProviderOperationContext | None = None,
     ) -> web.Response:
         """Non-streaming: collect all chunks, return one JSON.
 
@@ -535,17 +782,49 @@ class APIServer:
 
         budgets = DetectorBudgets.from_config(self._config.chatgpt, model)
 
-        async def _send_and_collect() -> str:
+        async def _send_and_collect() -> tuple[str, dict | None]:
             collected = ""
-            async for chunk in self._driver.send_and_stream(
-                text, timeout=timeout, budgets=budgets, model=model,
-            ):
+            terminal_receipt = None
+            send_kwargs = {"timeout": timeout, "budgets": budgets, "model": model}
+            if operation_context is not None:
+                send_kwargs["operation_context"] = operation_context
+            async for chunk in self._driver.send_and_stream(text, **send_kwargs):
                 collected += chunk.delta
-            return collected
+                if chunk.finish_reason == "stop" and chunk.final_text is not None:
+                    # DOM observations may be rewritten between progress updates.
+                    # Only the anchored terminal answer is the full response.
+                    if not isinstance(chunk.final_text, str):
+                        raise RuntimeError("invalid authoritative terminal response text")
+                    if operation_context is not None:
+                        import hashlib
+                        raw_receipt = chunk.provider_receipt
+                        expected = raw_receipt.get("response_sha256") if isinstance(raw_receipt, dict) else None
+                        actual = hashlib.sha256(chunk.final_text.encode("utf-8")).hexdigest()
+                        if expected != actual:
+                            raise RuntimeError("strict provider terminal response hash mismatch")
+                    collected = chunk.final_text
+                if operation_context is not None and chunk.finish_reason == "stop":
+                    terminal_receipt = _validated_terminal_receipt(
+                        chunk.provider_receipt, operation_context,
+                        (chunk.provider_receipt.get("conversation_id", "")
+                         if isinstance(chunk.provider_receipt, dict) else ""),
+                    )
+            if operation_context is not None and terminal_receipt is None:
+                raise RuntimeError("strict provider missing request-local terminal receipt")
+            return collected, terminal_receipt
 
-        full_text = await retry_on_rate_limit(self._driver, _send_and_collect)
+        if operation_context is not None:
+            # Strict provider mode never auto-replays a send. Any uncertain
+            # post-submit outcome is returned with its receipt for reconciliation.
+            full_text, terminal_receipt = await _send_and_collect()
+        else:
+            full_text, terminal_receipt = await retry_on_rate_limit(self._driver, _send_and_collect)
 
-        conv_id = self._driver._current_conv_id or ""
+        conv_id = (
+            terminal_receipt["conversation_id"]
+            if terminal_receipt is not None
+            else (self._driver._current_conv_id or "")
+        )
         self._last_conv_id = conv_id
         self._last_successful_send_at = time.time()
 
@@ -556,6 +835,11 @@ class APIServer:
                 "created": int(time.time()),
                 "model": model,
                 "conversation_id": conv_id,
+                **(
+                    {"provider_receipt": terminal_receipt}
+                    if terminal_receipt is not None
+                    else {}
+                ),
                 "choices": [
                     {
                         "index": 0,
@@ -568,7 +852,13 @@ class APIServer:
         )
 
     async def _stream_response(
-        self, request: web.Request, model: str, text: str, timeout: float
+        self,
+        request: web.Request,
+        model: str,
+        text: str,
+        timeout: float,
+        *,
+        operation_context: ProviderOperationContext | None = None,
     ) -> web.Response:
         """Streaming: SSE chunks as they arrive.
 
@@ -648,9 +938,10 @@ class APIServer:
         )
 
         try:
-            async for chunk in self._driver.send_and_stream(
-                text, timeout=timeout, budgets=budgets, model=model,
-            ):
+            send_kwargs = {"timeout": timeout, "budgets": budgets, "model": model}
+            if operation_context is not None:
+                send_kwargs["operation_context"] = operation_context
+            async for chunk in self._driver.send_and_stream(text, **send_kwargs):
                 if chunk.delta:
                     await self._send_sse(
                         resp,
@@ -669,7 +960,18 @@ class APIServer:
                         },
                     )
                 if chunk.finish_reason:
-                    conv_id = self._driver._current_conv_id or ""
+                    conv_id = (
+                        chunk.provider_receipt.get("conversation_id", "")
+                        if operation_context is not None and isinstance(chunk.provider_receipt, dict)
+                        else (self._driver._current_conv_id or "")
+                    )
+                    terminal_receipt = (
+                        _validated_terminal_receipt(
+                            chunk.provider_receipt, operation_context, conv_id
+                        )
+                        if operation_context is not None and chunk.finish_reason == "stop"
+                        else None
+                    )
                     self._last_conv_id = conv_id
                     if chunk.finish_reason == "stop":
                         self._last_successful_send_at = time.time()
@@ -681,11 +983,35 @@ class APIServer:
                             "created": created,
                             "model": model,
                             "conversation_id": conv_id,
+                            **(
+                                {"provider_receipt": terminal_receipt}
+                                if terminal_receipt is not None
+                                else {}
+                            ),
                             "choices": [
                                 {"index": 0, "delta": {}, "finish_reason": chunk.finish_reason}
                             ],
                         },
                     )
+        except ProviderOperationUncertainError as e:
+            logger.warning("Mid-stream provider effect uncertain: %s", e)
+            await self._send_sse(
+                resp,
+                {
+                    "id": cid,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "provider_receipt": e.receipt.to_dict(),
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "\n\n[Error: delivery_uncertain - reconcile before retry]"},
+                            "finish_reason": "error",
+                        }
+                    ],
+                },
+            )
         except RateLimitError as e:
             # Mid-stream throttle (rare after pre-flight). Status is locked at
             # 200, so we can't upgrade to 429; surface as an inline error chunk

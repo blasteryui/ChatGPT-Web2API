@@ -56,6 +56,7 @@ from .lock_resolver import (
     OwnedTabRequiredError,
     resolve_mutation_lock,
 )
+from .provider_contract import ProjectPlacementError, ProviderOperationContext
 from .resilience import retry_on_rate_limit
 from .tab_registry import TabRegistry
 
@@ -116,6 +117,17 @@ class ChatCompletionInput(BaseModel):
             "Changing this value starts a new conversation. "
             "Use list_projects to discover available projects."
         ),
+    )
+    strict_provider: bool = Field(
+        default=False,
+        description=(
+            "Fail closed on model/project verification and return a provider "
+            "operation receipt. Never auto-replays an uncertain send."
+        ),
+    )
+    operation_id: str | None = Field(
+        default=None,
+        description="Caller-stable operation ID for durable send reconciliation.",
     )
 
 
@@ -746,18 +758,25 @@ async def do_chat_completion(
     else:
         full_text = validated.message
 
-    # Select model if specified (non-fatal on failure)
+    observed_model = None
     if validated.model and validated.model != "auto":
-        selected = await driver.select_model(validated.model)
-        if not selected:
-            logger.warning(
-                "Could not select model '%s', proceeding with active model",
-                validated.model,
-            )
+        if validated.strict_provider:
+            observed_model = await driver.select_model_verified(validated.model)
+        else:
+            selected = await driver.select_model(validated.model)
+            if not selected:
+                logger.warning(
+                    "Could not select model '%s', proceeding with active model",
+                    validated.model,
+                )
+    elif validated.model == "auto":
+        observed_model = "auto"
 
     # Navigate to correct conversation context
     if validated.conversation_id:
-        await driver.navigate_conversation(validated.conversation_id)
+        await driver.navigate_conversation(
+            validated.conversation_id, project_id=project_id
+        )
     elif driver._current_conv_id and not validated.system_prompt and not project_id:
         # Auto-continue: reconcile against the live tab before sending. Another
         # process sharing the Chrome tab may have navigated it, leaving
@@ -768,6 +787,24 @@ async def do_chat_completion(
         await driver.ensure_current_conversation(driver._current_conv_id)
     else:
         await driver.navigate_new_chat(gizmo_id=project_id)
+
+    observed_project = (
+        await driver.observe_project_id(project_id) if project_id else None
+    )
+    if validated.strict_provider and project_id and observed_project != project_id:
+        raise ProjectPlacementError(project_id, observed_project)
+
+    operation_context = None
+    if validated.strict_provider:
+        import uuid
+
+        operation_context = ProviderOperationContext(
+            operation_id=validated.operation_id or str(uuid.uuid4()),
+            requested_project_id=project_id,
+            requested_model=validated.model,
+            observed_project_id=observed_project,
+            observed_model=observed_model,
+        )
 
     # Send and collect response. Progress notifications reset the MCP client's
     # idle timer during long generations so the tool call isn't killed at
@@ -787,9 +824,10 @@ async def do_chat_completion(
         if config is not None
         else None
     )
-    async for chunk in driver.send_and_stream(
-        full_text, timeout=120, budgets=_budgets, model=validated.model,
-    ):
+    send_kwargs = {"timeout": 120, "budgets": _budgets, "model": validated.model}
+    if operation_context is not None:
+        send_kwargs["operation_context"] = operation_context
+    async for chunk in driver.send_and_stream(full_text, **send_kwargs):
         if chunk.delta:
             full_response += chunk.delta
             chunk_count += 1
@@ -801,11 +839,14 @@ async def do_chat_completion(
             conv_id = driver._current_conv_id or ""
             await _notify(on_progress, "Finalizing…")
 
-    return {
+    result = {
         "content": full_response,
         "model": validated.model,
         "conversation_id": conv_id,
     }
+    if operation_context is not None and driver._last_provider_receipt is not None:
+        result["provider_receipt"] = driver._last_provider_receipt.to_dict()
+    return result
 
 
 async def do_list_models(driver: CDPDriver) -> dict:

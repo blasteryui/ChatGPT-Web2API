@@ -111,6 +111,17 @@ class ChromeProcess:
             self._healthy = True
             return
 
+        # This process is a browser attacher only. If the externally owned
+        # BrowserHost CDP disappears, fail without creating or restarting
+        # another Chromium profile. BrowserHost remains the sole lifecycle owner.
+        if getattr(self._cfg, "attach_only", False):
+            self._healthy = False
+            self._owns_chrome = False
+            raise RuntimeError(
+                f"Attach-only mode: no existing Chrome CDP on 127.0.0.1:{self._cfg.cdp_port}; "
+                "refusing to launch a browser"
+            )
+
         # Cold-start election: serialize the check→launch→ready transition.
         # Holding the lock through _wait_for_cdp prevents a second starter from
         # seeing a not-yet-ready Chrome as dead and double-launching.

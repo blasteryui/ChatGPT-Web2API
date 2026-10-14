@@ -27,7 +27,7 @@ from chatgpt_web2api.completion_detector import (
     CompletionDetector,
     DetectorBudgets,
 )
-from chatgpt_web2api.turn_anchor import TurnAnchor, TurnEndResult
+from chatgpt_web2api.turn_anchor import TurnAnchor, TurnEndResult, TurnTextResult
 
 
 def _make_detector(budgets=None, conv_id="conv-1"):
@@ -75,6 +75,85 @@ class _ScriptedPoll:
         if "innerText" in expr:
             return self.scan
         return "1"
+
+
+class _NoAssistantNode:
+    """Phase-1 DOM probes with a persistently absent assistant node."""
+
+    async def __call__(self, expr):
+        if "innerText" in expr:
+            return '{"text": ""}'
+        return "0"
+
+
+@pytest.mark.asyncio
+async def test_phase1_uses_turn_anchored_backend_completion_without_dom_node(monkeypatch):
+    """A terminal answer in the authenticated conversation mapping can
+    complete Phase 1 even when the assistant message never renders in DOM."""
+    from chatgpt_web2api.cdp_driver import StreamChunk
+
+    detector, driver = _make_detector()
+    driver._js_strict = _NoAssistantNode()
+    driver._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="matched", text="backend answer")
+    )
+    t = [0.0]
+    original_sleep = asyncio.sleep
+
+    async def fast_sleep(delay):
+        t[0] += delay
+        await original_sleep(0)
+
+    monkeypatch.setattr(time, "monotonic", lambda: t[0])
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+
+    chunks = [
+        chunk
+        async for chunk in detector.stream_until_complete(
+            initial_count=0,
+            timeout=120,
+            turn_anchor=TurnAnchor(sent_text="test", mode="fresh_chat"),
+        )
+    ]
+
+    assert chunks == [StreamChunk(delta="backend answer")]
+    assert driver._fetch_text_for_turn.await_count == 1
+    assert detector.last_dom_text == "backend answer"
+    assert t[0] < 90
+
+
+@pytest.mark.asyncio
+async def test_phase1_backend_not_ready_still_stalls_without_resending(monkeypatch):
+    """A user-only/incomplete backend state is not mistaken for a completed
+    answer and still reaches the bounded phase-1 stall error."""
+    from chatgpt_web2api.cdp_driver import GenerationStuckError
+
+    detector, driver = _make_detector()
+    driver._js_strict = _NoAssistantNode()
+    driver._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="not_ready", diagnostic={"reason": "user_only"})
+    )
+    t = [0.0]
+    original_sleep = asyncio.sleep
+
+    async def fast_sleep(delay):
+        t[0] += delay
+        await original_sleep(0)
+
+    monkeypatch.setattr(time, "monotonic", lambda: t[0])
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+
+    with pytest.raises(GenerationStuckError) as exc_info:
+        async for _ in detector.stream_until_complete(
+            initial_count=0,
+            timeout=120,
+            turn_anchor=TurnAnchor(sent_text="test", mode="fresh_chat"),
+        ):
+            pass
+
+    assert exc_info.value.phase == "phase_1_appear"
+    assert driver._fetch_text_for_turn.await_count > 1
+    assert t[0] >= 90
 
 
 # ── 1. Reasoning first-content does NOT fail at 90s ─────────────────────
