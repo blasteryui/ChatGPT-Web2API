@@ -65,6 +65,7 @@ class SharedDriver:
         await asyncio.sleep(0)
         # Another target's overlapping operation changed the old shared field.
         self._last_provider_receipt = completed("B", "conv-B")
+        self._current_conv_id = "conv-B"  # Concurrent B finished before A is validated
         yield StreamChunk(delta="", finish_reason="stop", provider_receipt=self.terminal)
         self._current_conv_id = "conv-B"
 
@@ -136,3 +137,57 @@ async def test_sse_foreign_receipt_fails_closed_without_stop(monkeypatch):
     assert "stop" not in reasons
     assert "error" in reasons
     assert not any(c.get("provider_receipt", {}).get("operation_id") == "B" for c in chunks)
+
+
+@pytest.mark.asyncio
+async def test_strict_missing_terminal_chunk_is_uncertain_not_success(monkeypatch):
+    srv = server(monkeypatch, completed("A", "conv-A"))
+
+    async def no_terminal(text, **kwargs):
+        yield StreamChunk(delta="partial A")
+
+    srv._driver.send_and_stream = no_terminal
+    with pytest.raises(RuntimeError, match="missing request-local terminal receipt"):
+        await srv._full_response(None, "auto", "fixture", 10, operation_context=context("A"))
+
+
+@pytest.mark.asyncio
+async def test_sse_valid_A_survives_global_conversation_B(monkeypatch):
+    from chatgpt_web2api import api_server
+
+    srv = server(monkeypatch, completed("A", "conv-A"))
+    events = []
+
+    async def send_sse(_response, payload):
+        events.append(payload)
+
+    async def circuit():
+        return None
+
+    class FakeStream:
+        headers = {}
+        content_type = ""
+
+        async def prepare(self, request):
+            return None
+
+        async def write(self, data):
+            return None
+
+        async def write_eof(self):
+            return None
+
+    async def probe(*args, **kwargs):
+        return json.dumps({"text": ""})
+
+    srv._driver._js_strict = probe
+    srv._check_circuit_or_recover = circuit
+    srv._send_sse = send_sse
+    monkeypatch.setattr(api_server.web, "StreamResponse", FakeStream)
+    await srv._stream_response(None, "auto", "fixture", 10, operation_context=context("A"))
+    terminal = [e for e in events if e.get("choices") and e["choices"][0]["finish_reason"] == "stop"]
+    assert len(terminal) == 1
+    assert terminal[0]["conversation_id"] == "conv-A"
+    assert terminal[0]["provider_receipt"]["operation_id"] == "A"
+    assert not any(e.get("choices") and e["choices"][0]["finish_reason"] == "error" for e in events)
+    assert srv._driver._current_conv_id == "conv-B"

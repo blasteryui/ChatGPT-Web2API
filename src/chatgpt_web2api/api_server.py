@@ -792,8 +792,11 @@ class APIServer:
                 if operation_context is not None and chunk.finish_reason == "stop":
                     terminal_receipt = _validated_terminal_receipt(
                         chunk.provider_receipt, operation_context,
-                        self._driver._current_conv_id or "",
+                        (chunk.provider_receipt.get("conversation_id", "")
+                         if isinstance(chunk.provider_receipt, dict) else ""),
                     )
+            if operation_context is not None and terminal_receipt is None:
+                raise RuntimeError("strict provider missing request-local terminal receipt")
             return collected, terminal_receipt
 
         if operation_context is not None:
@@ -943,7 +946,11 @@ class APIServer:
                         },
                     )
                 if chunk.finish_reason:
-                    conv_id = self._driver._current_conv_id or ""
+                    conv_id = (
+                        chunk.provider_receipt.get("conversation_id", "")
+                        if operation_context is not None and isinstance(chunk.provider_receipt, dict)
+                        else (self._driver._current_conv_id or "")
+                    )
                     terminal_receipt = (
                         _validated_terminal_receipt(
                             chunk.provider_receipt, operation_context, conv_id
