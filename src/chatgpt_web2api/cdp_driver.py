@@ -1395,52 +1395,68 @@ class CDPDriver:
         return observed
 
     async def navigate_new_chat(self, gizmo_id: str = None) -> None:
-        """Navigate to a fresh chat. Optionally scope to a project gizmo."""
-        if gizmo_id:
-            url = f"https://chatgpt.com/g/{gizmo_id}/project"
-        else:
-            # The bare ``chatgpt.com/`` home shell renders only the hidden
-            # fallback textarea (``name=prompt-textarea``, no id, not visible),
-            # so neither COMPOSER_SELECTOR nor COMPOSER_FALLBACK_SELECTOR matches
-            # and type_message fails with "No composer found". The
-            # ``?model=auto`` query triggers the SPA to render the real
-            # ProseMirror composer reliably. Verified live: bare home → no
-            # composer after 20s; ``?model=auto`` → composer present.
-            url = "https://chatgpt.com/?model=auto"
-        logger.info("Navigate: %s", url)
-        await self._cdp("Page.navigate", {"url": url})
-        await asyncio.sleep(2)
+        """Verify an empty fresh landing, never accept a ready previous composer.
 
-        # Wait for the composer. The new composer is a contenteditable
-        # ProseMirror div (#prompt-textarea is now a hidden fallback);
-        # COMPOSER_SELECTOR matches the real textbox, with the legacy
-        # textarea as a last resort for older deployments.
-        for _ in range(30):
-            result = await self._js(
-                "(function() {"
-                "  return JSON.stringify({"
-                f"    ready: !!document.querySelector('{COMPOSER_SELECTOR}') || !!document.querySelector('{COMPOSER_FALLBACK_SELECTOR}'),"
-                "    url: location.href"
-                "  });"
-                "})()"
-            )
-            try:
-                state = json.loads(result)
-                if state.get("ready"):
-                    actual_url = state.get("url", "")
-                    # #14: verify we actually landed on chatgpt.com, not an
-                    # error/recovery page that happens to have a textarea.
-                    if "chatgpt.com" not in actual_url:
-                        raise RuntimeError(f"Navigation landed on unexpected URL: {actual_url}")
-                    logger.info("Page ready: %s", actual_url)
-                    break
-            except (json.JSONDecodeError, TypeError):
-                pass
-            await asyncio.sleep(0.5)
+        Old SPA content can remain ready after Page.navigate. Capturing its old
+        assistant count makes a real new generation fail the appearance gate.
+        Exact route and empty-thread evidence must agree before Send is allowed.
+        """
+        from urllib.parse import urlsplit
 
-        # Settle time for sentinel init
-        await asyncio.sleep(2)
+        expected_path = f"/g/{gizmo_id}/project" if gizmo_id else "/"
+        url = "https://chatgpt.com" + expected_path
+        if not gizmo_id:
+            url += "?model=auto"
         self._current_conv_id = None
+        logger.info("Navigate: %s", url)
+        navigation = await self._cdp("Page.navigate", {"url": url})
+        if isinstance(navigation, dict) and navigation.get("errorText"):
+            raise RuntimeError("fresh chat landing: navigation failed")
+        await asyncio.sleep(2)
+        consecutive = 0
+        last_reason = "unobserved"
+        for _ in range(30):
+            try:
+                result = await self._js_strict(
+                    "(function(){"
+                    f"const c=document.querySelector('{COMPOSER_SELECTOR}')||document.querySelector('{COMPOSER_FALLBACK_SELECTOR}');"
+                    "return JSON.stringify({"
+                    "ready:!!c&&(c.offsetWidth>0||c.offsetHeight>0)&&!c.disabled,"
+                    "ready_state:document.readyState,url:location.href,"
+                    "assistant_count:document.querySelectorAll('[data-message-author-role=assistant], [data-chatgpt-selection-message-id]').length,"
+                    "user_count:document.querySelectorAll('[data-message-author-role=user], [data-user-message-bubble]').length,"
+                    "composer_empty:!!c&&!(c.innerText||c.value||'').trim()"
+                    "});})()"
+                )
+                state = json.loads(result)
+                current = urlsplit(state.get("url", ""))
+                route_ok = (
+                    current.scheme == "https" and current.hostname == "chatgpt.com"
+                    and (current.path.rstrip("/") or "/") == expected_path
+                )
+                counts_ok = (
+                    type(state.get("assistant_count")) is int and state["assistant_count"] == 0
+                    and type(state.get("user_count")) is int and state["user_count"] == 0
+                )
+                ready = (
+                    route_ok and counts_ok and state.get("ready") is True
+                    and state.get("ready_state") == "complete"
+                    and state.get("composer_empty") is True
+                )
+                if ready:
+                    consecutive += 1
+                    if consecutive == 2:
+                        logger.info("Verified empty fresh landing: %s", state["url"])
+                        return
+                else:
+                    consecutive = 0
+                    last_reason = "route_or_empty_thread_or_composer_not_verified"
+            except (json.JSONDecodeError, TypeError, ValueError, CDPJSError):
+                consecutive = 0
+                last_reason = "fresh_probe_unavailable"
+            await asyncio.sleep(0.5)
+        raise RuntimeError("fresh chat landing not verified: " + last_reason)
+
 
     async def _has_composer(self) -> bool:
         """Is a send-capable composer present on the live tab?
